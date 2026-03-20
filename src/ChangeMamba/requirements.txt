@@ -1,0 +1,17 @@
+torch
+torchvision
+torchaudio
+packaging
+triton
+timm==0.4.12
+pytest 
+chardet 
+yacs 
+termcolor
+submitit 
+tensorboardX
+swanlab
+python-dotenv
+fvcore
+seaborn
+prodigyopt

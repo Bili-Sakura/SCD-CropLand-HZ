@@ -1,0 +1,37 @@
+# ChangeMamba SCD — VMamba-Base (architecture: vssm_base_224)
+# Paths are relative to the repository root unless absolute.
+# CLI flags override values from this file when both are used.
+
+cfg: src/ChangeMamba/changedetection/configs/vssm1/vssm_base_224.yaml
+pretrained_weight_path: models/MzeroMiko/VMamba/vssm_base_0229_ckpt_epoch_237.pth
+resume: null
+
+dataset: JL1_second
+train_dataset_path: datasets/JL1_second/train
+train_data_list_path: datasets/JL1_second/train.txt
+test_dataset_path: datasets/JL1_second/val
+test_data_list_path: datasets/JL1_second/val.txt
+
+type: train
+shuffle: true
+batch_size: 8
+num_workers: 2
+crop_size: 224
+eval_crop_size: 256
+max_iters: 50000
+save_interval: 5000
+
+optimizer: prodigy
+learning_rate: 1.0
+momentum: 0.9
+weight_decay: 0.0005
+prodigy_weight_decay: 0.01
+prodigy_slice_p: 1
+prodigy_d_coef: 1.0
+
+model_type: ChangeMambaSCD
+model_param_path: models/BiliSakura
+model_save_path: models/BiliSakura/JL1-ChangeMambaSCD
+
+cuda: true
+start_iter: 0
