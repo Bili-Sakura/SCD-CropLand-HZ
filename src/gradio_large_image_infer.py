@@ -10,6 +10,7 @@ import argparse
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 # Repo root: .../src/gradio_large_image_infer.py -> parents[1]
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +21,20 @@ import numpy as np
 import torch
 
 import gradio as gr
+
+try:
+    import fiona
+    import rasterio
+    from rasterio import features as rio_features
+    from rasterio.warp import transform_geom
+
+    _HAS_RASTERIO = True
+except ImportError:
+    _HAS_RASTERIO = False
+    fiona = None  # type: ignore
+    rasterio = None  # type: ignore
+    rio_features = None  # type: ignore
+    transform_geom = None  # type: ignore
 
 from ChangeMamba.changedetection.configs.config import get_config
 from ChangeMamba.changedetection.datasets import imutils
@@ -65,39 +80,198 @@ def _pad_pair_to_multiple(
     return out_pre, out_post, (ph, pw)
 
 
+def _is_vector_gt_path(p: Path) -> bool:
+    if p.suffix.lower() == ".shp":
+        return True
+    if p.is_dir():
+        return any(p.glob("*.shp"))
+    return False
+
+
+def _resolve_shapefile_path(p: Path) -> Path:
+    if p.suffix.lower() == ".shp":
+        return p
+    if p.is_dir():
+        shps = sorted(p.glob("*.shp"))
+        if len(shps) == 1:
+            return shps[0]
+        if len(shps) == 0:
+            raise FileNotFoundError(f"No .shp file in directory: {p}")
+        raise ValueError(f"Multiple .shp files in {p}; pass the path to one .shp file.")
+    raise FileNotFoundError(f"Not a shapefile path: {p}")
+
+
+def _vector_label_from_props(props: dict[str, Any], explicit_field: str | None) -> int | float:
+    if explicit_field:
+        if explicit_field not in props:
+            raise KeyError(f"Attribute {explicit_field!r} not found on vector features.")
+        v = props[explicit_field]
+    else:
+        skip = {
+            "id",
+            "objectid",
+            "fid",
+            "shape_area",
+            "shape_len",
+            "shape_length",
+            "area",
+            "perimeter",
+            "length",
+        }
+        v = None
+        for k, raw in props.items():
+            lk = str(k).lower()
+            if lk in skip or lk.endswith("_id") or lk == "id":
+                continue
+            if isinstance(raw, (int, np.integer)) and not isinstance(raw, bool):
+                v = int(raw)
+                break
+            if isinstance(raw, float) and not isinstance(raw, bool):
+                if raw == int(raw):
+                    v = int(raw)
+                    break
+                v = raw
+                break
+        if v is None:
+            for _k, raw in props.items():
+                if isinstance(raw, str) and raw.strip().lstrip("-").isdigit():
+                    v = int(raw.strip())
+                    break
+        if v is None:
+            raise ValueError(
+                "Could not infer a class attribute on the shapefile. "
+                "Add an integer field (0–5 for JL1 semantics) or install/configure attributes."
+            )
+    if isinstance(v, str) and v.strip().lstrip("-").isdigit():
+        v = int(v.strip())
+    if isinstance(v, float) and v == int(v):
+        v = int(v)
+    return v
+
+
+def _rasterize_vector_gt(
+    gt_path: Path,
+    ref_raster_path: Path,
+    target_hw: tuple[int, int],
+    *,
+    kind: str,
+    label_field: str | None,
+) -> np.ndarray:
+    """Burn vector polygons onto the same grid as the unpadded T1 image (via ref_raster_path)."""
+    if not _HAS_RASTERIO:
+        raise RuntimeError(
+            "Vector ground truth requires rasterio and fiona. Install with: pip install rasterio fiona"
+        )
+    shp = _resolve_shapefile_path(gt_path)
+    h0, w0 = target_hw
+    pairs: list[tuple[dict, int | float]] = []
+    vec_crs = None
+    with fiona.open(str(shp)) as src:
+        if src.crs is not None:
+            vec_crs = rasterio.crs.CRS.from_user_input(src.crs)
+        for feat in src:
+            geom = feat.get("geometry")
+            if geom is None:
+                continue
+            props = feat.get("properties") or {}
+            if kind == "cd":
+                val: int | float = 255
+            else:
+                val = _vector_label_from_props(props, label_field)
+                if isinstance(val, float) and val != int(val):
+                    raise ValueError(f"Semantic label must be integer-like, got {val!r} from vector.")
+                val = int(val)
+            pairs.append((geom, val))
+
+    if not pairs:
+        raise ValueError(f"No features with geometry in vector: {shp}")
+
+    with rasterio.open(str(ref_raster_path)) as ref:
+        ref_crs = ref.crs
+        if ref_crs is None:
+            raise ValueError(f"Reference raster has no CRS; cannot align vector GT: {ref_raster_path}")
+        window = rasterio.windows.Window(0, 0, w0, h0)
+        transform = ref.window_transform(window)
+
+        def _iter_shapes():
+            for geom, val in pairs:
+                g = geom
+                if vec_crs is not None and vec_crs != ref_crs:
+                    g = transform_geom(vec_crs, ref_crs, g)
+                yield (g, val)
+
+        if kind == "cd":
+            dtype = np.float32
+            fill = 0.0
+        else:
+            dtype = np.int32
+            fill = 0
+        out = rio_features.rasterize(
+            _iter_shapes(),
+            out_shape=(h0, w0),
+            transform=transform,
+            fill=fill,
+            dtype=dtype,
+            all_touched=False,
+        )
+    return np.asarray(out)
+
+
 def _load_gt_maps(
     gt_cd_path: str | None,
     gt_t1_path: str | None,
     gt_t2_path: str | None,
     target_hw: tuple[int, int],
+    *,
+    ref_raster_path: str | None,
+    vector_label_field: str | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
-    """Load GT_CD (0/1), GT_T1, GT_T2 class indices; crop/pad to target H,W."""
+    """Load GT_CD (0/1), GT_T1, GT_T2 class indices at target H×W (raster or vector)."""
     th, tw = target_hw
+    field = (vector_label_field or "").strip() or None
 
-    def _load_cd(p: str) -> np.ndarray:
+    def _load_cd_raster(p: str) -> np.ndarray:
         x = np.asarray(imageio.imread(p))
         if x.ndim == 3:
             x = x[..., 0]
         x = (x > 127).astype(np.float32)
         return x
 
-    def _load_sem(p: str) -> np.ndarray:
+    def _load_sem_raster(p: str) -> np.ndarray:
         x = np.asarray(imageio.imread(p))
         if x.ndim == 3:
             x = x[..., 0]
         return x.astype(np.int32)
 
-    cd = _load_cd(gt_cd_path) if gt_cd_path else None
-    t1 = _load_sem(gt_t1_path) if gt_t1_path else None
-    t2 = _load_sem(gt_t2_path) if gt_t2_path else None
+    def _load_one(path_str: str, name: str, kind: str) -> np.ndarray:
+        p = Path(path_str).expanduser().resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"{name} not found: {p}")
+        if _is_vector_gt_path(p):
+            if not ref_raster_path:
+                raise ValueError(
+                    f"{name} is vector data (.shp). Run inference with the T1 raster path first "
+                    "so labels can be rasterized to the same grid (or export GT to GeoTIFF/PNG)."
+                )
+            ref_p = Path(ref_raster_path).expanduser().resolve()
+            if not ref_p.is_file():
+                raise FileNotFoundError(f"Reference raster for vector GT not found: {ref_p}")
+            return _rasterize_vector_gt(p, ref_p, (th, tw), kind=kind, label_field=field)
+        if kind == "cd":
+            return _load_cd_raster(str(p))
+        return _load_sem_raster(str(p))
+
+    cd = _load_one(gt_cd_path, "GT_CD", "cd") if gt_cd_path else None
+    t1 = _load_one(gt_t1_path, "GT_T1", "sem") if gt_t1_path else None
+    t2 = _load_one(gt_t2_path, "GT_T2", "sem") if gt_t2_path else None
 
     for name, arr in (("GT_CD", cd), ("GT_T1", t1), ("GT_T2", t2)):
         if arr is None:
             continue
         if arr.shape[0] != th or arr.shape[1] != tw:
             raise ValueError(
-                f"{name} size {arr.shape[:2]} does not match padded image size {(th, tw)}. "
-                "Use the same resolution as T1/T2 after padding, or resize GT externally."
+                f"{name} size {arr.shape[:2]} does not match image size {(th, tw)}. "
+                "For rasters, match T1/T2 resolution; for shapefiles, check CRS alignment with the T1 reference."
             )
     return cd, t1, t2
 
@@ -176,6 +350,8 @@ class Session:
     cfg_path: str = ""
     pretrained_backbone: str | None = None
     checkpoint_path: str | None = None
+    # T1 path from last inference — georeference for rasterizing vector GT (shapefile) in Evaluate
+    ref_t1_path: str | None = None
     # Cropped to original image size (h0, w0), same as saved previews — for Evaluate
     pred_change_mask: np.ndarray | None = None
     pred_sem_t1: np.ndarray | None = None
@@ -219,6 +395,7 @@ def load_model_fn(
     _SESSION.cfg_path = cfg
     _SESSION.pretrained_backbone = pb
     _SESSION.checkpoint_path = ck
+    _SESSION.ref_t1_path = None
     _SESSION.pred_change_mask = _SESSION.pred_sem_t1 = _SESSION.pred_sem_t2 = None
     return f"Model ready on {device} (cfg={Path(cfg).name}, checkpoint={'yes' if ck else 'no'})."
 
@@ -332,6 +509,7 @@ def run_tiled_inference(
     imageio.imwrite(str(p_t1), rgb_t1)
     imageio.imwrite(str(p_t2), rgb_t2)
 
+    _SESSION.ref_t1_path = t1_path
     _SESSION.pred_change_mask = cm.copy()
     _SESSION.pred_sem_t1 = t1_crop.copy()
     _SESSION.pred_sem_t2 = t2_crop.copy()
@@ -352,7 +530,12 @@ def run_tiled_inference(
     )
 
 
-def run_evaluation(gt_cd_path: str, gt_t1_path: str, gt_t2_path: str):
+def run_evaluation(
+    gt_cd_path: str,
+    gt_t1_path: str,
+    gt_t2_path: str,
+    vector_label_field: str,
+):
     if _SESSION.pred_change_mask is None:
         return "", "Run **Run tiled inference** first so predictions are available."
 
@@ -368,8 +551,17 @@ def run_evaluation(gt_cd_path: str, gt_t1_path: str, gt_t2_path: str):
         return "", "Provide all three paths: GT_CD, GT_T1, and GT_T2."
 
     h0, w0 = cm.shape[:2]
+    ref_t1 = _SESSION.ref_t1_path
+    vfield = (vector_label_field or "").strip() or None
     try:
-        gt_cd, gt_t1, gt_t2 = _load_gt_maps(gt_cd_s, gt_t1_s, gt_t2_s, (h0, w0))
+        gt_cd, gt_t1, gt_t2 = _load_gt_maps(
+            gt_cd_s,
+            gt_t1_s,
+            gt_t2_s,
+            (h0, w0),
+            ref_raster_path=ref_t1,
+            vector_label_field=vfield,
+        )
     except Exception as e:
         return "", str(e)
 
@@ -418,7 +610,12 @@ def build_app():
             "3. **Evaluate vs GT** (optional, second button).\n\n"
             f"Class legend uses **{NUM_CLASSES}** JL1 semantic indices (0–5). "
             "Metrics use the **37-class SCD** encoding from training (`train_MambaSCD` validation). "
-            "GT rasters must match **T1/T2 resolution** (unpadded image size)."
+            "GT rasters must match **T1/T2 resolution** (unpadded image size). "
+            "Vector GT (**`.shp`** or a folder containing one shapefile) is rasterized with **rasterio** "
+            "onto the **T1 image grid** from the last inference (same CRS as the T1 GeoTIFF/raster). "
+            "Install **`pip install rasterio fiona`** if you use shapefiles. "
+            "Semantic shapefiles need an integer class field (JL1 indices 0–5); set **Vector label field** "
+            "if the attribute name is not detected automatically."
         )
         with gr.Tabs():
             with gr.Tab("Model"):
@@ -443,9 +640,23 @@ def build_app():
                 out_path = gr.Textbox(label="Output folder used")
                 run_status = gr.Textbox(label="Inference log", lines=6)
                 gr.Markdown("### Evaluation (after inference)")
-                gt_cd = gr.Textbox(label="GT_CD path", placeholder="…/GT_CD/large.png")
-                gt_t1 = gr.Textbox(label="GT_T1 path", placeholder="…/GT_T1/large.png")
-                gt_t2 = gr.Textbox(label="GT_T2 path", placeholder="…/GT_T2/large.png")
+                gt_cd = gr.Textbox(
+                    label="GT_CD path",
+                    placeholder="…/GT_CD/large.png or …/change.shp (polygons → binary mask)",
+                )
+                gt_t1 = gr.Textbox(
+                    label="GT_T1 path",
+                    placeholder="…/GT_T1/large.tif/.png or …/sem_t1.shp",
+                )
+                gt_t2 = gr.Textbox(
+                    label="GT_T2 path",
+                    placeholder="…/GT_T2/large.tif/.png or …/sem_t2.shp",
+                )
+                vec_lbl = gr.Textbox(
+                    label="Vector label field (optional)",
+                    placeholder="e.g. class_id — for .shp semantic layers; leave empty to auto-pick",
+                    lines=1,
+                )
                 eval_btn = gr.Button("Evaluate vs ground truth", variant="primary")
                 metrics = gr.Markdown()
                 eval_status = gr.Textbox(label="Evaluation log", lines=3)
@@ -454,7 +665,7 @@ def build_app():
                     [t1, t2, psz, mb, odir],
                     [change_prev, sem1_prev, sem2_prev, out_path, run_status, metrics, eval_status],
                 )
-                eval_btn.click(run_evaluation, [gt_cd, gt_t1, gt_t2], [metrics, eval_status])
+                eval_btn.click(run_evaluation, [gt_cd, gt_t1, gt_t2, vec_lbl], [metrics, eval_status])
 
     return demo
 
