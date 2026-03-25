@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Gradio UI: load ChangeMambaSCD, run tiled 256×256 inference on large T1/T2 image pairs,
-stitch predictions, save full-resolution outputs, and optionally compare to GT (SCD metrics).
+Gradio UI: load ChangeMambaSCD, run tiled inference on large T1/T2 pairs, save outputs,
+then optionally run a separate evaluation step against GT (two buttons).
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -177,6 +176,10 @@ class Session:
     cfg_path: str = ""
     pretrained_backbone: str | None = None
     checkpoint_path: str | None = None
+    # Cropped to original image size (h0, w0), same as saved previews — for Evaluate
+    pred_change_mask: np.ndarray | None = None
+    pred_sem_t1: np.ndarray | None = None
+    pred_sem_t2: np.ndarray | None = None
 
 
 _SESSION = Session()
@@ -216,6 +219,7 @@ def load_model_fn(
     _SESSION.cfg_path = cfg
     _SESSION.pretrained_backbone = pb
     _SESSION.checkpoint_path = ck
+    _SESSION.pred_change_mask = _SESSION.pred_sem_t1 = _SESSION.pred_sem_t2 = None
     return f"Model ready on {device} (cfg={Path(cfg).name}, checkpoint={'yes' if ck else 'no'})."
 
 
@@ -225,9 +229,6 @@ def run_tiled_inference(
     patch_size: int,
     micro_batch: int,
     out_dir: str,
-    gt_cd_path: str,
-    gt_t1_path: str,
-    gt_t2_path: str,
     progress: gr.Progress,
 ):
     if _SESSION.model is None or _SESSION.device is None:
@@ -236,20 +237,21 @@ def run_tiled_inference(
             None,
             None,
             None,
-            "",
             "Load the model first (Model tab).",
+            "",
+            "",
         )
         return
 
     t1_path = (t1_path or "").strip()
     t2_path = (t2_path or "").strip()
     if not t1_path or not t2_path:
-        yield (None, None, None, None, "", "Provide absolute paths to T1 and T2 images.")
+        yield (None, None, None, None, "Provide absolute paths to T1 and T2 images.", "", "")
         return
 
     patch_size = int(patch_size)
     if patch_size <= 0:
-        yield (None, None, None, None, "", "patch_size must be positive.")
+        yield (None, None, None, None, "patch_size must be positive.", "", "")
         return
     micro_batch = max(1, int(micro_batch))
 
@@ -260,7 +262,7 @@ def run_tiled_inference(
         pre_img = _load_rgb_f32(t1_path)
         post_img = _load_rgb_f32(t2_path)
     except Exception as e:
-        yield (None, None, None, None, "", f"Failed to read images: {e}")
+        yield (None, None, None, None, f"Failed to read images: {e}", "", "")
         return
 
     if pre_img.shape[:2] != post_img.shape[:2]:
@@ -269,8 +271,9 @@ def run_tiled_inference(
             None,
             None,
             None,
-            "",
             f"T1 shape {pre_img.shape[:2]} != T2 shape {post_img.shape[:2]}.",
+            "",
+            "",
         )
         return
 
@@ -278,27 +281,6 @@ def run_tiled_inference(
     H, W = pre_pad.shape[:2]
     nh, nw = H // patch_size, W // patch_size
     n_patches = nh * nw
-
-    gt_cd_s = (gt_cd_path or "").strip()
-    gt_t1_s = (gt_t1_path or "").strip()
-    gt_t2_s = (gt_t2_path or "").strip()
-    gt_cd = gt_t1 = gt_t2 = None
-    if gt_cd_s or gt_t1_s or gt_t2_s:
-        if not (gt_cd_s and gt_t1_s and gt_t2_s):
-            yield (
-                None,
-                None,
-                None,
-                None,
-                "",
-                "For metrics, provide all three: GT_CD, GT_T1, and GT_T2 paths (or leave all empty).",
-            )
-            return
-        try:
-            gt_cd, gt_t1, gt_t2 = _load_gt_maps(gt_cd_s, gt_t1_s, gt_t2_s, (H, W))
-        except Exception as e:
-            yield (None, None, None, None, "", str(e))
-            return
 
     coords = [(i, j) for i in range(0, H, patch_size) for j in range(0, W, patch_size)]
     change_full = np.zeros((H, W), dtype=np.int32)
@@ -350,38 +332,73 @@ def run_tiled_inference(
     imageio.imwrite(str(p_t1), rgb_t1)
     imageio.imwrite(str(p_t2), rgb_t2)
 
-    metrics_md = ""
-    status_tail = f"Saved:\n- {p_change}\n- {p_t1}\n- {p_t2}"
-    if gt_cd is not None and gt_t1 is not None and gt_t2 is not None:
-        labels_cd_np = (gt_cd > 0.5).astype(np.int32)
-        labels_A = gt_t1
-        labels_B = gt_t2
-        preds_scd = (t1_crop - 1) * 6 + t2_crop
-        preds_scd[cm == 0] = 0
-        labels_scd = (labels_A - 1) * 6 + labels_B
-        labels_scd[labels_cd_np == 0] = 0
-        hist = np.zeros((NUM_SCD_CLASSES, NUM_SCD_CLASSES), dtype=np.float64)
-        oa, _ = accuracy(preds_scd, labels_scd)
-        hist += get_hist(preds_scd, labels_scd, NUM_SCD_CLASSES)
-        kappa_n0, Fscd, IoU_mean, Sek = SCDD_metrics_from_hist(hist)
-        metrics_md = (
-            "| Metric | Value |\n|:---|---:|\n"
-            f"| OA | {oa:.4f} |\n"
-            f"| Kappa (no n00) | {kappa_n0:.4f} |\n"
-            f"| Fscd | {Fscd:.4f} |\n"
-            f"| mIoU (binary change) | {IoU_mean:.4f} |\n"
-            f"| SeK | {Sek:.4f} |\n"
-        )
-        status_tail += "\n\nMetrics computed on valid pixels (SCD encoding, same as training validation)."
+    _SESSION.pred_change_mask = cm.copy()
+    _SESSION.pred_sem_t1 = t1_crop.copy()
+    _SESSION.pred_sem_t2 = t2_crop.copy()
+
+    status_tail = (
+        f"Saved:\n- {p_change}\n- {p_t1}\n- {p_t2}\n\n"
+        "Predictions are cached for **Evaluate** (same resolution as T1/T2, unpadded)."
+    )
 
     yield (
         np.stack([change_vis] * 3, axis=-1),
         rgb_t1,
         rgb_t2,
         str(out_root),
-        metrics_md,
         status_tail,
+        "",
+        "",
     )
+
+
+def run_evaluation(gt_cd_path: str, gt_t1_path: str, gt_t2_path: str):
+    if _SESSION.pred_change_mask is None:
+        return "", "Run **Run tiled inference** first so predictions are available."
+
+    cm = _SESSION.pred_change_mask
+    t1_crop = _SESSION.pred_sem_t1
+    t2_crop = _SESSION.pred_sem_t2
+    assert t1_crop is not None and t2_crop is not None
+
+    gt_cd_s = (gt_cd_path or "").strip()
+    gt_t1_s = (gt_t1_path or "").strip()
+    gt_t2_s = (gt_t2_path or "").strip()
+    if not (gt_cd_s and gt_t1_s and gt_t2_s):
+        return "", "Provide all three paths: GT_CD, GT_T1, and GT_T2."
+
+    h0, w0 = cm.shape[:2]
+    try:
+        gt_cd, gt_t1, gt_t2 = _load_gt_maps(gt_cd_s, gt_t1_s, gt_t2_s, (h0, w0))
+    except Exception as e:
+        return "", str(e)
+
+    if gt_cd is None or gt_t1 is None or gt_t2 is None:
+        return "", "Failed to load ground truth."
+
+    labels_cd_np = (gt_cd > 0.5).astype(np.int32)
+    labels_A = gt_t1
+    labels_B = gt_t2
+    preds_scd = (t1_crop - 1) * 6 + t2_crop
+    preds_scd[cm == 0] = 0
+    labels_scd = (labels_A - 1) * 6 + labels_B
+    labels_scd[labels_cd_np == 0] = 0
+    hist = np.zeros((NUM_SCD_CLASSES, NUM_SCD_CLASSES), dtype=np.float64)
+    oa, _ = accuracy(preds_scd, labels_scd)
+    hist += get_hist(preds_scd, labels_scd, NUM_SCD_CLASSES)
+    kappa_n0, Fscd, IoU_mean, Sek = SCDD_metrics_from_hist(hist)
+    metrics_md = (
+        "| Metric | Value |\n|:---|---:|\n"
+        f"| OA | {oa:.4f} |\n"
+        f"| Kappa (no n00) | {kappa_n0:.4f} |\n"
+        f"| Fscd | {Fscd:.4f} |\n"
+        f"| mIoU (binary change) | {IoU_mean:.4f} |\n"
+        f"| SeK | {Sek:.4f} |\n"
+    )
+    status = (
+        f"Evaluated on {h0}×{w0} (SCD 37-class encoding, same as training validation)."
+    )
+    return metrics_md, status
 
 
 def build_app():
@@ -397,10 +414,11 @@ def build_app():
     with gr.Blocks(title="ChangeMamba SCD — large-image tiled inference") as demo:
         gr.Markdown(
             "## Large-image semantic change detection\n"
-            "Load **ChangeMambaSCD**, run **tiled** inference (default 256×256), stitch to full resolution, "
-            "save predictions, and optionally compare to **GT_CD / GT_T1 / GT_T2** (JL1-style layout).\n\n"
+            "1. **Load model** → 2. **Run tiled inference** (default 256×256 patches) → saves maps and caches preds → "
+            "3. **Evaluate vs GT** (optional, second button).\n\n"
             f"Class legend uses **{NUM_CLASSES}** JL1 semantic indices (0–5). "
-            "Metrics use the **37-class SCD** encoding from training (`train_MambaSCD` validation)."
+            "Metrics use the **37-class SCD** encoding from training (`train_MambaSCD` validation). "
+            "GT rasters must match **T1/T2 resolution** (unpadded image size)."
         )
         with gr.Tabs():
             with gr.Tab("Model"):
@@ -418,21 +436,25 @@ def build_app():
                 psz = gr.Number(label="Patch size (px)", value=256, precision=0)
                 mb = gr.Number(label="Micro-batch (patches per forward)", value=4, precision=0)
                 odir = gr.Textbox(label="Output directory", placeholder="default: <repo>/outputs/gradio_scd")
-                gt_cd = gr.Textbox(label="GT_CD path (optional)", placeholder="…/GT_CD/large.png")
-                gt_t1 = gr.Textbox(label="GT_T1 path (optional)", placeholder="…/GT_T1/large.png")
-                gt_t2 = gr.Textbox(label="GT_T2 path (optional)", placeholder="…/GT_T2/large.png")
                 run_btn = gr.Button("Run tiled inference", variant="primary")
                 change_prev = gr.Image(label="Predicted change map (stitched)", type="numpy")
                 sem1_prev = gr.Image(label="Predicted semantic T1 (colored)", type="numpy")
                 sem2_prev = gr.Image(label="Predicted semantic T2 (colored)", type="numpy")
                 out_path = gr.Textbox(label="Output folder used")
+                run_status = gr.Textbox(label="Inference log", lines=6)
+                gr.Markdown("### Evaluation (after inference)")
+                gt_cd = gr.Textbox(label="GT_CD path", placeholder="…/GT_CD/large.png")
+                gt_t1 = gr.Textbox(label="GT_T1 path", placeholder="…/GT_T1/large.png")
+                gt_t2 = gr.Textbox(label="GT_T2 path", placeholder="…/GT_T2/large.png")
+                eval_btn = gr.Button("Evaluate vs ground truth", variant="primary")
                 metrics = gr.Markdown()
-                run_status = gr.Textbox(label="Log", lines=6)
+                eval_status = gr.Textbox(label="Evaluation log", lines=3)
                 run_btn.click(
                     run_tiled_inference,
-                    [t1, t2, psz, mb, odir, gt_cd, gt_t1, gt_t2],
-                    [change_prev, sem1_prev, sem2_prev, out_path, metrics, run_status],
+                    [t1, t2, psz, mb, odir],
+                    [change_prev, sem1_prev, sem2_prev, out_path, run_status, metrics, eval_status],
                 )
+                eval_btn.click(run_evaluation, [gt_cd, gt_t1, gt_t2], [metrics, eval_status])
 
     return demo
 
