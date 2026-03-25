@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +21,7 @@ import numpy as np
 import torch
 
 import gradio as gr
+from PIL import Image, ImageDraw
 
 try:
     import fiona
@@ -40,10 +41,13 @@ from ChangeMamba.changedetection.configs.config import get_config
 from ChangeMamba.changedetection.datasets import imutils
 from ChangeMamba.changedetection.models.ChangeMambaSCD import ChangeMambaSCD
 from ChangeMamba.changedetection.utils_func.mcd_utils import SCDD_metrics_from_hist, accuracy, get_hist
-from datasets.colormap import NUM_CLASSES, index2color
+from datasets.colormap import JL1_CLASSES, NUM_CLASSES, index2color
 
 
 NUM_SCD_CLASSES = 37
+MAX_SCENE_PREVIEW_SIDE = 1400
+MAX_PATCH_CARD_SIDE = 320
+MAX_PATCH_SAMPLES = 12
 
 
 def _load_rgb_f32(path: str) -> np.ndarray:
@@ -285,6 +289,187 @@ def _semantic_rgb(pred_cls: np.ndarray, change_mask: np.ndarray) -> np.ndarray:
     return rgb
 
 
+def _downsample_to_max_side(arr: np.ndarray, max_side: int) -> np.ndarray:
+    h, w = arr.shape[:2]
+    long_side = max(h, w)
+    if long_side <= max_side:
+        return arr
+    step = int(np.ceil(long_side / max_side))
+    return arr[::step, ::step]
+
+
+def _fit_long_side(arr: np.ndarray, max_side: int, *, nearest: bool = False) -> np.ndarray:
+    h, w = arr.shape[:2]
+    long_side = max(h, w)
+    if long_side <= max_side:
+        return arr
+    scale = max_side / float(long_side)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    pil = Image.fromarray(arr)
+    resample = Image.Resampling.NEAREST if nearest else Image.Resampling.BILINEAR
+    return np.asarray(pil.resize((new_w, new_h), resample=resample))
+
+
+def _to_display_rgb(img: np.ndarray) -> np.ndarray:
+    x = np.asarray(img)
+    if x.ndim == 2:
+        x = np.stack([x] * 3, axis=-1)
+    elif x.shape[-1] > 3:
+        x = x[..., :3]
+    if x.dtype == np.uint8:
+        return np.ascontiguousarray(x)
+
+    x = np.nan_to_num(x.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    if x.size == 0:
+        return np.zeros((*x.shape[:2], 3), dtype=np.uint8)
+
+    if float(np.max(x)) <= 1.0 and float(np.min(x)) >= 0.0:
+        return np.clip(x * 255.0, 0, 255).astype(np.uint8)
+
+    out = np.zeros_like(x, dtype=np.uint8)
+    for c in range(min(3, x.shape[-1])):
+        chan = x[..., c]
+        lo = float(np.percentile(chan, 2.0))
+        hi = float(np.percentile(chan, 98.0))
+        if hi <= lo:
+            lo = float(np.min(chan))
+            hi = float(np.max(chan))
+        if hi <= lo:
+            out[..., c] = np.clip(chan, 0, 255).astype(np.uint8)
+        else:
+            out[..., c] = np.clip((chan - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
+    return out
+
+
+def _alpha_blend(base: np.ndarray, overlay: np.ndarray, mask: np.ndarray, alpha: float) -> np.ndarray:
+    mask3 = np.asarray(mask > 0, dtype=bool)[..., None]
+    overlay_f = overlay.astype(np.float32)
+    base_f = base.astype(np.float32)
+    blended = (1.0 - alpha) * base_f + alpha * overlay_f
+    out = np.where(mask3, blended, base_f)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _change_overlay(base: np.ndarray, change_mask: np.ndarray, alpha: float = 0.65) -> np.ndarray:
+    red = np.zeros_like(base, dtype=np.uint8)
+    red[..., 0] = 255
+    return _alpha_blend(base, red, change_mask, alpha=alpha)
+
+
+def _semantic_overlay(base: np.ndarray, pred_cls: np.ndarray, change_mask: np.ndarray, alpha: float = 0.6) -> np.ndarray:
+    sem_rgb = _semantic_rgb(pred_cls, change_mask)
+    return _alpha_blend(base, sem_rgb, change_mask, alpha=alpha)
+
+
+def _make_strip(images: list[np.ndarray], *, pad: int = 6, bg: int = 255) -> np.ndarray:
+    valid = [img for img in images if img is not None]
+    if not valid:
+        return np.zeros((1, 1, 3), dtype=np.uint8)
+    max_h = max(img.shape[0] for img in valid)
+    total_w = sum(img.shape[1] for img in valid) + pad * (len(valid) - 1)
+    canvas = np.full((max_h, total_w, 3), bg, dtype=np.uint8)
+    x0 = 0
+    for img in valid:
+        h, w = img.shape[:2]
+        y0 = (max_h - h) // 2
+        canvas[y0 : y0 + h, x0 : x0 + w] = img
+        x0 += w + pad
+    return canvas
+
+
+def _make_grid(images: list[np.ndarray], *, cols: int = 3, pad: int = 6, bg: int = 255) -> np.ndarray:
+    valid = [img for img in images if img is not None]
+    if not valid:
+        return np.zeros((1, 1, 3), dtype=np.uint8)
+    rows = int(np.ceil(len(valid) / cols))
+    row_heights: list[int] = []
+    col_widths: list[int] = []
+    for r in range(rows):
+        row_imgs = valid[r * cols : (r + 1) * cols]
+        row_heights.append(max(img.shape[0] for img in row_imgs))
+    for c in range(cols):
+        col_imgs = valid[c::cols]
+        if col_imgs:
+            col_widths.append(max(img.shape[1] for img in col_imgs))
+    total_h = sum(row_heights) + pad * (rows - 1)
+    total_w = sum(col_widths) + pad * (len(col_widths) - 1)
+    canvas = np.full((total_h, total_w, 3), bg, dtype=np.uint8)
+    y0 = 0
+    for r in range(rows):
+        x0 = 0
+        row_imgs = valid[r * cols : (r + 1) * cols]
+        for c, img in enumerate(row_imgs):
+            h, w = img.shape[:2]
+            yy = y0 + (row_heights[r] - h) // 2
+            xx = x0 + (col_widths[c] - w) // 2
+            canvas[yy : yy + h, xx : xx + w] = img
+            x0 += col_widths[c] + pad
+        y0 += row_heights[r] + pad
+    return canvas
+
+
+def _draw_patch_box(scene_img: np.ndarray, original_hw: tuple[int, int], bounds: tuple[int, int, int, int]) -> np.ndarray:
+    h0, w0 = original_hw
+    y0, x0, y1, x1 = bounds
+    scene_h, scene_w = scene_img.shape[:2]
+    x0s = int(round(x0 * scene_w / w0))
+    x1s = max(x0s + 1, int(round(x1 * scene_w / w0)))
+    y0s = int(round(y0 * scene_h / h0))
+    y1s = max(y0s + 1, int(round(y1 * scene_h / h0)))
+    pil = Image.fromarray(scene_img)
+    draw = ImageDraw.Draw(pil)
+    for offset in range(3):
+        draw.rectangle(
+            [(x0s - offset, y0s - offset), (x1s + offset, y1s + offset)],
+            outline=(255, 215, 0),
+            width=1,
+        )
+    return np.asarray(pil)
+
+
+def _empty_patch_outputs():
+    return (
+        gr.update(choices=[], value=None),
+        None,
+        None,
+        None,
+        [],
+        "Patch explorer is empty. Run tiled inference to populate representative tiles.",
+    )
+
+
+def _empty_inference_outputs(status: str):
+    return (
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        *_empty_patch_outputs(),
+        "",
+        status,
+        "",
+        "",
+    )
+
+
+@dataclass
+class PatchSample:
+    label: str
+    row: int
+    col: int
+    bounds: tuple[int, int, int, int]
+    change_ratio: float
+    scene_view: np.ndarray
+    input_strip: np.ndarray
+    pred_strip: np.ndarray
+    gallery_card: np.ndarray
+
+
 def _build_model_and_load(
     cfg_path: str,
     pretrained_backbone: str | None,
@@ -356,9 +541,159 @@ class Session:
     pred_change_mask: np.ndarray | None = None
     pred_sem_t1: np.ndarray | None = None
     pred_sem_t2: np.ndarray | None = None
+    image_hw: tuple[int, int] | None = None
+    patch_grid: tuple[int, int] | None = None
+    scene_t1_preview: np.ndarray | None = None
+    scene_t2_preview: np.ndarray | None = None
+    scene_change_overlay: np.ndarray | None = None
+    scene_sem_t1_overlay: np.ndarray | None = None
+    scene_sem_t2_overlay: np.ndarray | None = None
+    patch_samples: dict[str, PatchSample] = field(default_factory=dict)
+    patch_sample_labels: list[str] = field(default_factory=list)
 
 
 _SESSION = Session()
+
+
+def _reset_cached_outputs() -> None:
+    _SESSION.ref_t1_path = None
+    _SESSION.pred_change_mask = None
+    _SESSION.pred_sem_t1 = None
+    _SESSION.pred_sem_t2 = None
+    _SESSION.image_hw = None
+    _SESSION.patch_grid = None
+    _SESSION.scene_t1_preview = None
+    _SESSION.scene_t2_preview = None
+    _SESSION.scene_change_overlay = None
+    _SESSION.scene_sem_t1_overlay = None
+    _SESSION.scene_sem_t2_overlay = None
+    _SESSION.patch_samples.clear()
+    _SESSION.patch_sample_labels.clear()
+
+
+def _select_patch_samples(
+    patch_stats: list[tuple[float, int, int, int]],
+    max_samples: int,
+) -> list[tuple[float, int, int, int]]:
+    if not patch_stats:
+        return []
+    ranked = sorted(patch_stats, key=lambda item: (-item[0], item[1]))
+    chosen: list[tuple[float, int, int, int]] = []
+    seen: set[int] = set()
+
+    for item in ranked:
+        if item[0] <= 0:
+            continue
+        idx = item[1]
+        if idx in seen:
+            continue
+        chosen.append(item)
+        seen.add(idx)
+        if len(chosen) >= max_samples:
+            return chosen
+
+    if len(chosen) < max_samples:
+        if len(patch_stats) <= max_samples:
+            fill_indices = range(len(patch_stats))
+        else:
+            fill_indices = np.linspace(0, len(patch_stats) - 1, num=max_samples, dtype=int).tolist()
+        for pos in fill_indices:
+            item = patch_stats[int(pos)]
+            idx = item[1]
+            if idx in seen:
+                continue
+            chosen.append(item)
+            seen.add(idx)
+            if len(chosen) >= max_samples:
+                break
+
+    return chosen
+
+
+def _build_patch_visuals(
+    pre_img: np.ndarray,
+    post_img: np.ndarray,
+    change_mask: np.ndarray,
+    t1_pred: np.ndarray,
+    t2_pred: np.ndarray,
+    patch_size: int,
+    nh: int,
+    nw: int,
+    scene_change_overlay: np.ndarray,
+) -> tuple[dict[str, PatchSample], list[tuple[np.ndarray, str]]]:
+    h0, w0 = change_mask.shape[:2]
+    patch_stats: list[tuple[float, int, int, int]] = []
+    for idx, (y0, x0) in enumerate((i, j) for i in range(0, h0, patch_size) for j in range(0, w0, patch_size)):
+        y1 = min(y0 + patch_size, h0)
+        x1 = min(x0 + patch_size, w0)
+        patch_ratio = float(np.mean(change_mask[y0:y1, x0:x1] > 0))
+        row = idx // nw
+        col = idx % nw
+        patch_stats.append((patch_ratio, idx, row, col))
+
+    selected = _select_patch_samples(patch_stats, MAX_PATCH_SAMPLES)
+    patch_samples: dict[str, PatchSample] = {}
+    gallery_items: list[tuple[np.ndarray, str]] = []
+
+    for change_ratio, idx, row, col in selected:
+        y0 = row * patch_size
+        x0 = col * patch_size
+        y1 = min(y0 + patch_size, h0)
+        x1 = min(x0 + patch_size, w0)
+
+        pre_crop = _to_display_rgb(pre_img[y0:y1, x0:x1])
+        post_crop = _to_display_rgb(post_img[y0:y1, x0:x1])
+        change_crop = change_mask[y0:y1, x0:x1]
+        t1_crop = t1_pred[y0:y1, x0:x1]
+        t2_crop = t2_pred[y0:y1, x0:x1]
+        change_vis = _change_overlay(post_crop, change_crop)
+        t1_overlay = _semantic_overlay(pre_crop, t1_crop, change_crop)
+        t2_overlay = _semantic_overlay(post_crop, t2_crop, change_crop)
+
+        pre_crop = _fit_long_side(pre_crop, MAX_PATCH_CARD_SIDE)
+        post_crop = _fit_long_side(post_crop, MAX_PATCH_CARD_SIDE)
+        change_vis = _fit_long_side(change_vis, MAX_PATCH_CARD_SIDE)
+        t1_overlay = _fit_long_side(t1_overlay, MAX_PATCH_CARD_SIDE)
+        t2_overlay = _fit_long_side(t2_overlay, MAX_PATCH_CARD_SIDE)
+
+        input_strip = _make_strip([pre_crop, post_crop])
+        pred_strip = _make_strip([change_vis, t1_overlay, t2_overlay])
+        gallery_card = _make_grid([pre_crop, post_crop, change_vis, t1_overlay, t2_overlay], cols=3)
+        label = f"Patch {idx + 1} - row {row + 1}/{nh}, col {col + 1}/{nw} - changed {change_ratio:.1%}"
+        sample = PatchSample(
+            label=label,
+            row=row,
+            col=col,
+            bounds=(y0, x0, y1, x1),
+            change_ratio=change_ratio,
+            scene_view=_draw_patch_box(scene_change_overlay, (h0, w0), (y0, x0, y1, x1)),
+            input_strip=input_strip,
+            pred_strip=pred_strip,
+            gallery_card=gallery_card,
+        )
+        patch_samples[label] = sample
+        gallery_items.append((gallery_card, label))
+
+    return patch_samples, gallery_items
+
+
+def show_patch_details(patch_label: str):
+    label = (patch_label or "").strip()
+    if not label or label not in _SESSION.patch_samples:
+        return None, None, None, "Select one representative patch after inference finishes."
+
+    sample = _SESSION.patch_samples[label]
+    h0, w0 = _SESSION.image_hw or (0, 0)
+    nh, nw = _SESSION.patch_grid or (0, 0)
+    y0, x0, y1, x1 = sample.bounds
+    info = (
+        f"Viewing {sample.label}\n"
+        f"- pixel bounds: y={y0}:{y1}, x={x0}:{x1}\n"
+        f"- patch size on disk: {y1 - y0} x {x1 - x0}\n"
+        f"- scene size: {h0} x {w0}\n"
+        f"- patch grid: {nh} rows x {nw} cols"
+    )
+    return sample.scene_view, sample.input_strip, sample.pred_strip, info
 
 
 def load_model_fn(
@@ -395,8 +730,7 @@ def load_model_fn(
     _SESSION.cfg_path = cfg
     _SESSION.pretrained_backbone = pb
     _SESSION.checkpoint_path = ck
-    _SESSION.ref_t1_path = None
-    _SESSION.pred_change_mask = _SESSION.pred_sem_t1 = _SESSION.pred_sem_t2 = None
+    _reset_cached_outputs()
     return f"Model ready on {device} (cfg={Path(cfg).name}, checkpoint={'yes' if ck else 'no'})."
 
 
@@ -409,49 +743,34 @@ def run_tiled_inference(
     progress: gr.Progress,
 ):
     if _SESSION.model is None or _SESSION.device is None:
-        yield (
-            None,
-            None,
-            None,
-            None,
-            "Load the model first (Model tab).",
-            "",
-            "",
-        )
+        yield _empty_inference_outputs("Load the model first (Model tab).")
         return
 
     t1_path = (t1_path or "").strip()
     t2_path = (t2_path or "").strip()
     if not t1_path or not t2_path:
-        yield (None, None, None, None, "Provide absolute paths to T1 and T2 images.", "", "")
+        yield _empty_inference_outputs("Provide absolute paths to T1 and T2 images.")
         return
 
     patch_size = int(patch_size)
     if patch_size <= 0:
-        yield (None, None, None, None, "patch_size must be positive.", "", "")
+        yield _empty_inference_outputs("patch_size must be positive.")
         return
     micro_batch = max(1, int(micro_batch))
 
     device = _SESSION.device
     model = _SESSION.model
+    _reset_cached_outputs()
 
     try:
         pre_img = _load_rgb_f32(t1_path)
         post_img = _load_rgb_f32(t2_path)
     except Exception as e:
-        yield (None, None, None, None, f"Failed to read images: {e}", "", "")
+        yield _empty_inference_outputs(f"Failed to read images: {e}")
         return
 
     if pre_img.shape[:2] != post_img.shape[:2]:
-        yield (
-            None,
-            None,
-            None,
-            None,
-            f"T1 shape {pre_img.shape[:2]} != T2 shape {post_img.shape[:2]}.",
-            "",
-            "",
-        )
+        yield _empty_inference_outputs(f"T1 shape {pre_img.shape[:2]} != T2 shape {post_img.shape[:2]}.")
         return
 
     pre_pad, post_pad, _ = _pad_pair_to_multiple(pre_img, post_img, patch_size)
@@ -499,6 +818,32 @@ def run_tiled_inference(
     rgb_t1 = _semantic_rgb(t1_crop, cm)
     rgb_t2 = _semantic_rgb(t2_crop, cm)
 
+    pre_scene_small = _to_display_rgb(_downsample_to_max_side(pre_img, MAX_SCENE_PREVIEW_SIDE))
+    post_scene_small = _to_display_rgb(_downsample_to_max_side(post_img, MAX_SCENE_PREVIEW_SIDE))
+    cm_scene = _downsample_to_max_side(cm, MAX_SCENE_PREVIEW_SIDE)
+    t1_scene = _downsample_to_max_side(t1_crop, MAX_SCENE_PREVIEW_SIDE)
+    t2_scene = _downsample_to_max_side(t2_crop, MAX_SCENE_PREVIEW_SIDE)
+    scene_change_overlay = _change_overlay(post_scene_small, cm_scene)
+    scene_sem_t1_overlay = _semantic_overlay(pre_scene_small, t1_scene, cm_scene)
+    scene_sem_t2_overlay = _semantic_overlay(post_scene_small, t2_scene, cm_scene)
+    patch_samples, patch_gallery = _build_patch_visuals(
+        pre_img,
+        post_img,
+        cm,
+        t1_crop,
+        t2_crop,
+        patch_size,
+        nh,
+        nw,
+        scene_change_overlay,
+    )
+    patch_labels = list(patch_samples.keys())
+    if patch_labels:
+        patch_dropdown = gr.update(choices=patch_labels, value=patch_labels[0])
+        patch_scene, patch_inputs, patch_preds, patch_info = show_patch_details(patch_labels[0])
+    else:
+        patch_dropdown, patch_scene, patch_inputs, patch_preds, patch_gallery, patch_info = _empty_patch_outputs()
+
     out_root = Path((out_dir or "").strip() or str(_PROJECT_ROOT / "outputs" / "gradio_scd"))
     out_root.mkdir(parents=True, exist_ok=True)
     stem = Path(t1_path).stem
@@ -513,16 +858,38 @@ def run_tiled_inference(
     _SESSION.pred_change_mask = cm.copy()
     _SESSION.pred_sem_t1 = t1_crop.copy()
     _SESSION.pred_sem_t2 = t2_crop.copy()
+    _SESSION.image_hw = (h0, w0)
+    _SESSION.patch_grid = (nh, nw)
+    _SESSION.scene_t1_preview = pre_scene_small
+    _SESSION.scene_t2_preview = post_scene_small
+    _SESSION.scene_change_overlay = scene_change_overlay
+    _SESSION.scene_sem_t1_overlay = scene_sem_t1_overlay
+    _SESSION.scene_sem_t2_overlay = scene_sem_t2_overlay
+    _SESSION.patch_samples = patch_samples
+    _SESSION.patch_sample_labels = patch_labels
 
     status_tail = (
+        f"Input scene: {h0}x{w0}px, patch grid: {nh} x {nw} ({n_patches} tiles), patch size: {patch_size}px, micro-batch: {micro_batch}\n"
+        "UI view: downsampled scene previews + representative patch explorer for large-image inspection.\n\n"
         f"Saved:\n- {p_change}\n- {p_t1}\n- {p_t2}\n\n"
         "Predictions are cached for **Evaluate** (same resolution as T1/T2, unpadded)."
     )
 
     yield (
+        pre_scene_small,
+        post_scene_small,
+        scene_change_overlay,
+        scene_sem_t1_overlay,
+        scene_sem_t2_overlay,
         np.stack([change_vis] * 3, axis=-1),
         rgb_t1,
         rgb_t2,
+        patch_dropdown,
+        patch_scene,
+        patch_inputs,
+        patch_preds,
+        patch_gallery,
+        patch_info,
         str(out_root),
         status_tail,
         "",
@@ -608,6 +975,9 @@ def build_app():
             "## Large-image semantic change detection\n"
             "1. **Load model** → 2. **Run tiled inference** (default 256×256 patches) → saves maps and caches preds → "
             "3. **Evaluate vs GT** (optional, second button).\n\n"
+            "The viewer is optimized for very large rasters: it shows **downsampled full-scene context** for T1/T2, "
+            "**prediction overlays** that are easier to read than raw stitched masks, and a **representative patch explorer** "
+            "that surfaces the most changed tiles so users can inspect local evidence without opening the saved files manually.\n\n"
             f"Class legend uses **{NUM_CLASSES}** JL1 semantic indices (0–5). "
             "Metrics use the **37-class SCD** encoding from training (`train_MambaSCD` validation). "
             "GT rasters must match **T1/T2 resolution** (unpadded image size). "
@@ -634,9 +1004,27 @@ def build_app():
                 mb = gr.Number(label="Micro-batch (patches per forward)", value=4, precision=0)
                 odir = gr.Textbox(label="Output directory", placeholder="default: <repo>/outputs/gradio_scd")
                 run_btn = gr.Button("Run tiled inference", variant="primary")
-                change_prev = gr.Image(label="Predicted change map (stitched)", type="numpy")
-                sem1_prev = gr.Image(label="Predicted semantic T1 (colored)", type="numpy")
-                sem2_prev = gr.Image(label="Predicted semantic T2 (colored)", type="numpy")
+                class_legend = ", ".join(f"{idx}: {name}" for idx, name in enumerate(JL1_CLASSES))
+                gr.Markdown(f"**JL1 legend** — {class_legend}")
+                with gr.Accordion("Large-scene viewer", open=True):
+                    with gr.Row():
+                        scene_t1_prev = gr.Image(label="T1 overview (downsampled)", type="numpy")
+                        scene_t2_prev = gr.Image(label="T2 overview (downsampled)", type="numpy")
+                    with gr.Row():
+                        scene_change_prev = gr.Image(label="Change overlay on T2", type="numpy")
+                        scene_sem1_prev = gr.Image(label="Semantic overlay on T1", type="numpy")
+                        scene_sem2_prev = gr.Image(label="Semantic overlay on T2", type="numpy")
+                with gr.Accordion("Representative patch explorer", open=True):
+                    patch_choice = gr.Dropdown(label="Representative patch", choices=[], value=None, interactive=True)
+                    patch_info = gr.Textbox(label="Patch details", lines=5)
+                    patch_scene = gr.Image(label="Patch location in scene", type="numpy")
+                    patch_inputs = gr.Image(label="Patch inputs (T1 | T2)", type="numpy")
+                    patch_preds = gr.Image(label="Patch predictions (change | semantic T1 | semantic T2)", type="numpy")
+                    patch_gallery = gr.Gallery(label="Representative patch cards", columns=3, rows=2, object_fit="contain", height="auto")
+                with gr.Accordion("Saved stitched outputs", open=False):
+                    change_prev = gr.Image(label="Predicted change map (stitched)", type="numpy")
+                    sem1_prev = gr.Image(label="Predicted semantic T1 (colored)", type="numpy")
+                    sem2_prev = gr.Image(label="Predicted semantic T2 (colored)", type="numpy")
                 out_path = gr.Textbox(label="Output folder used")
                 run_status = gr.Textbox(label="Inference log", lines=6)
                 gr.Markdown("### Evaluation (after inference)")
@@ -663,8 +1051,28 @@ def build_app():
                 run_btn.click(
                     run_tiled_inference,
                     [t1, t2, psz, mb, odir],
-                    [change_prev, sem1_prev, sem2_prev, out_path, run_status, metrics, eval_status],
+                    [
+                        scene_t1_prev,
+                        scene_t2_prev,
+                        scene_change_prev,
+                        scene_sem1_prev,
+                        scene_sem2_prev,
+                        change_prev,
+                        sem1_prev,
+                        sem2_prev,
+                        patch_choice,
+                        patch_scene,
+                        patch_inputs,
+                        patch_preds,
+                        patch_gallery,
+                        patch_info,
+                        out_path,
+                        run_status,
+                        metrics,
+                        eval_status,
+                    ],
                 )
+                patch_choice.change(show_patch_details, patch_choice, [patch_scene, patch_inputs, patch_preds, patch_info])
                 eval_btn.click(run_evaluation, [gt_cd, gt_t1, gt_t2, vec_lbl], [metrics, eval_status])
 
     return demo
