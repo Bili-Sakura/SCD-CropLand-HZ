@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Gradio UI: load ChangeMambaSCD, run tiled inference on large T1/T2 pairs, save outputs,
-then optionally run a separate evaluation step against GT (two buttons).
+Gradio UI: load ChangeMambaSCD or ChangeMambaBCD, run tiled inference on large T1/T2 pairs,
+save outputs, then optionally evaluate against GT (SCD: CD + semantics; BCD: binary CD only).
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 # Repo root: .../src/gradio_large_image_infer.py -> parents[1]
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -50,7 +50,9 @@ except ImportError:
 
 from ChangeMamba.changedetection.configs.config import get_config
 from ChangeMamba.changedetection.datasets import imutils
+from ChangeMamba.changedetection.models.ChangeMambaBCD import ChangeMambaBCD
 from ChangeMamba.changedetection.models.ChangeMambaSCD import ChangeMambaSCD
+from ChangeMamba.changedetection.utils_func.metrics import Evaluator
 from ChangeMamba.changedetection.utils_func.mcd_utils import SCDD_metrics_from_hist, accuracy, get_hist
 from datasets.colormap import JL1_CLASSES, NUM_CLASSES, index2color
 
@@ -63,6 +65,8 @@ MAX_PATCH_SAMPLES = 12
 _DEFAULT_SCD_CHECKPOINT = str(
     _PROJECT_ROOT / "models" / "BiliSakura" / "JL1-ChangeMambaSCD" / "Base" / "best_model.pth"
 )
+
+TaskMode = Literal["scd", "bcd"]
 
 _DATA_ROOT = _PROJECT_ROOT / "data"
 _DATA_SELECT_EXTS = frozenset({".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".shp"})
@@ -683,27 +687,37 @@ def _draw_patch_box(scene_img: np.ndarray, original_hw: tuple[int, int], bounds:
     return np.asarray(pil)
 
 
+def _patch_pred_label() -> str:
+    return (
+        "Patch predictions (change | semantic T1 | semantic T2)"
+        if _SESSION.task_mode == "scd"
+        else "Patch prediction (binary change on T2)"
+    )
+
+
 def _empty_patch_outputs():
     return (
         gr.update(choices=[], value=None),
         None,
         None,
         None,
+        gr.update(value=None, label=_patch_pred_label()),
         [],
         "Patch explorer is empty. Run tiled inference to populate representative tiles.",
     )
 
 
 def _empty_inference_outputs(status: str):
+    sem_vis = _SESSION.task_mode == "scd"
     return (
         None,
         None,
         None,
+        gr.update(value=None, visible=sem_vis),
+        gr.update(value=None, visible=sem_vis),
         None,
-        None,
-        None,
-        None,
-        None,
+        gr.update(value=None, visible=sem_vis),
+        gr.update(value=None, visible=sem_vis),
         *_empty_patch_outputs(),
         "",
         status,
@@ -783,9 +797,72 @@ def _build_model_and_load(
     return model
 
 
+def _build_bcd_model_and_load(
+    cfg_path: str,
+    pretrained_backbone: str | None,
+    checkpoint_path: str | None,
+    device: torch.device,
+) -> ChangeMambaBCD:
+    class _Args:
+        def __init__(self):
+            self.cfg = cfg_path
+            self.opts = None
+
+    config = get_config(_Args())
+    model = ChangeMambaBCD(
+        pretrained=pretrained_backbone,
+        patch_size=config.MODEL.VSSM.PATCH_SIZE,
+        in_chans=config.MODEL.VSSM.IN_CHANS,
+        num_classes=config.MODEL.NUM_CLASSES,
+        depths=config.MODEL.VSSM.DEPTHS,
+        dims=config.MODEL.VSSM.EMBED_DIM,
+        ssm_d_state=config.MODEL.VSSM.SSM_D_STATE,
+        ssm_ratio=config.MODEL.VSSM.SSM_RATIO,
+        ssm_rank_ratio=config.MODEL.VSSM.SSM_RANK_RATIO,
+        ssm_dt_rank=("auto" if config.MODEL.VSSM.SSM_DT_RANK == "auto" else int(config.MODEL.VSSM.SSM_DT_RANK)),
+        ssm_act_layer=config.MODEL.VSSM.SSM_ACT_LAYER,
+        ssm_conv=config.MODEL.VSSM.SSM_CONV,
+        ssm_conv_bias=config.MODEL.VSSM.SSM_CONV_BIAS,
+        ssm_drop_rate=config.MODEL.VSSM.SSM_DROP_RATE,
+        ssm_init=config.MODEL.VSSM.SSM_INIT,
+        forward_type=config.MODEL.VSSM.SSM_FORWARDTYPE,
+        mlp_ratio=config.MODEL.VSSM.MLP_RATIO,
+        mlp_act_layer=config.MODEL.VSSM.MLP_ACT_LAYER,
+        mlp_drop_rate=config.MODEL.VSSM.MLP_DROP_RATE,
+        drop_path_rate=config.MODEL.DROP_PATH_RATE,
+        patch_norm=config.MODEL.VSSM.PATCH_NORM,
+        norm_layer=config.MODEL.VSSM.NORM_LAYER,
+        downsample_version=config.MODEL.VSSM.DOWNSAMPLE,
+        patchembed_version=config.MODEL.VSSM.PATCHEMBED,
+        gmlp=config.MODEL.VSSM.GMLP,
+        use_checkpoint=config.TRAIN.USE_CHECKPOINT,
+    )
+    model = model.to(device)
+    model.eval()
+
+    if checkpoint_path:
+        ckpt_path = Path(checkpoint_path).expanduser().resolve()
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        ckpt = torch.load(str(ckpt_path), map_location="cpu")
+        if isinstance(ckpt, dict) and "model" in ckpt:
+            state = ckpt["model"]
+        else:
+            state = ckpt
+        model_dict = {}
+        state_dict = model.state_dict()
+        for k, v in state.items():
+            if k in state_dict:
+                model_dict[k] = v
+        state_dict.update(model_dict)
+        model.load_state_dict(state_dict, strict=False)
+    return model
+
+
 @dataclass
 class Session:
-    model: ChangeMambaSCD | None = None
+    model: ChangeMambaSCD | ChangeMambaBCD | None = None
+    task_mode: TaskMode = "scd"
     device: torch.device | None = None
     cfg_path: str = ""
     pretrained_backbone: str | None = None
@@ -794,7 +871,7 @@ class Session:
     ref_raster_path: str | None = None
     # Cropped to original image size (h0, w0), same as saved previews — for Evaluate
     pred_change_mask: np.ndarray | None = None
-    pred_sem_t1: np.ndarray | None = None
+    pred_sem_t1: np.ndarray | None = None  # None in BCD mode (no semantic heads)
     pred_sem_t2: np.ndarray | None = None
     image_hw: tuple[int, int] | None = None
     patch_grid: tuple[int, int] | None = None
@@ -936,10 +1013,70 @@ def _build_patch_visuals(
     return patch_samples, gallery_items
 
 
+def _build_patch_visuals_bcd(
+    pre_img: np.ndarray,
+    post_img: np.ndarray,
+    change_mask: np.ndarray,
+    patch_size: int,
+    nh: int,
+    nw: int,
+    scene_change_overlay: np.ndarray,
+) -> tuple[dict[str, PatchSample], list[tuple[np.ndarray, str]]]:
+    """Patch cards for binary change only (no semantic T1/T2 panels)."""
+    h0, w0 = change_mask.shape[:2]
+    patch_stats: list[tuple[float, int, int, int]] = []
+    for idx, (y0, x0) in enumerate((i, j) for i in range(0, h0, patch_size) for j in range(0, w0, patch_size)):
+        y1 = min(y0 + patch_size, h0)
+        x1 = min(x0 + patch_size, w0)
+        patch_ratio = float(np.mean(change_mask[y0:y1, x0:x1] > 0))
+        row = idx // nw
+        col = idx % nw
+        patch_stats.append((patch_ratio, idx, row, col))
+
+    selected = _select_patch_samples(patch_stats, MAX_PATCH_SAMPLES)
+    patch_samples: dict[str, PatchSample] = {}
+    gallery_items: list[tuple[np.ndarray, str]] = []
+
+    for change_ratio, idx, row, col in selected:
+        y0 = row * patch_size
+        x0 = col * patch_size
+        y1 = min(y0 + patch_size, h0)
+        x1 = min(x0 + patch_size, w0)
+
+        pre_crop = _to_display_rgb(pre_img[y0:y1, x0:x1])
+        post_crop = _to_display_rgb(post_img[y0:y1, x0:x1])
+        change_crop = change_mask[y0:y1, x0:x1]
+        change_vis = _change_overlay(post_crop, change_crop)
+
+        pre_crop = _fit_long_side(pre_crop, MAX_PATCH_CARD_SIDE)
+        post_crop = _fit_long_side(post_crop, MAX_PATCH_CARD_SIDE)
+        change_vis = _fit_long_side(change_vis, MAX_PATCH_CARD_SIDE)
+
+        input_strip = _make_strip([pre_crop, post_crop])
+        pred_strip = change_vis
+        gallery_card = _make_grid([pre_crop, post_crop, change_vis], cols=3)
+        label = f"Patch {idx + 1} - row {row + 1}/{nh}, col {col + 1}/{nw} - changed {change_ratio:.1%}"
+        sample = PatchSample(
+            label=label,
+            row=row,
+            col=col,
+            bounds=(y0, x0, y1, x1),
+            change_ratio=change_ratio,
+            scene_view=_draw_patch_box(scene_change_overlay, (h0, w0), (y0, x0, y1, x1)),
+            input_strip=input_strip,
+            pred_strip=pred_strip,
+            gallery_card=gallery_card,
+        )
+        patch_samples[label] = sample
+        gallery_items.append((gallery_card, label))
+
+    return patch_samples, gallery_items
+
+
 def show_patch_details(patch_label: str):
     label = (patch_label or "").strip()
     if not label or label not in _SESSION.patch_samples:
-        return None, None, None, "Select one representative patch after inference finishes."
+        return None, None, gr.update(value=None, label=_patch_pred_label()), "Select one representative patch after inference finishes."
 
     sample = _SESSION.patch_samples[label]
     h0, w0 = _SESSION.image_hw or (0, 0)
@@ -952,10 +1089,11 @@ def show_patch_details(patch_label: str):
         f"- scene size: {h0} x {w0}\n"
         f"- patch grid: {nh} rows x {nw} cols"
     )
-    return sample.scene_view, sample.input_strip, sample.pred_strip, info
+    return sample.scene_view, sample.input_strip, gr.update(value=sample.pred_strip, label=_patch_pred_label()), info
 
 
 def load_model_fn(
+    task_mode: str,
     cfg_path: str,
     pretrained_backbone: str,
     checkpoint_path: str,
@@ -965,6 +1103,8 @@ def load_model_fn(
     device = torch.device("cuda" if use_cuda and torch.cuda.is_available() else "cpu")
     if use_cuda and not torch.cuda.is_available():
         return "CUDA requested but not available; falling back would happen at inference — uncheck GPU or install CUDA PyTorch."
+
+    mode: TaskMode = "bcd" if (task_mode or "").strip().lower() == "bcd" else "scd"
 
     cfg = (cfg_path or "").strip()
     if not cfg:
@@ -980,17 +1120,25 @@ def load_model_fn(
     ck = checkpoint_path.strip() or None
 
     try:
-        model = _build_model_and_load(cfg, pb, ck, device)
+        if mode == "bcd":
+            model = _build_bcd_model_and_load(cfg, pb, ck, device)
+        else:
+            model = _build_model_and_load(cfg, pb, ck, device)
     except Exception as e:
         return f"Failed to load model: {e}"
 
     _SESSION.model = model
+    _SESSION.task_mode = mode
     _SESSION.device = device
     _SESSION.cfg_path = cfg
     _SESSION.pretrained_backbone = pb
     _SESSION.checkpoint_path = ck
     _reset_cached_outputs()
-    return f"Model ready on {device} (cfg={Path(cfg).name}, checkpoint={'yes' if ck else 'no'})."
+    kind = "ChangeMambaBCD" if mode == "bcd" else "ChangeMambaSCD"
+    return (
+        f"Model ready on {device}: **{kind}** (cfg={Path(cfg).name}, checkpoint={'yes' if ck else 'no'}). "
+        f"Task mode: **{mode.upper()}**."
+    )
 
 
 def run_tiled_inference(
@@ -1073,6 +1221,7 @@ def run_tiled_inference(
     change_full = np.zeros((H, W), dtype=np.int32)
     t1_full = np.zeros((H, W), dtype=np.int32)
     t2_full = np.zeros((H, W), dtype=np.int32)
+    is_bcd = _SESSION.task_mode == "bcd"
 
     n_batches = (len(coords) + micro_batch - 1) // micro_batch
     with torch.no_grad():
@@ -1096,15 +1245,20 @@ def run_tiled_inference(
                 tensors_post.append(_to_chw_normalized(crop_post))
             b_pre = _stack_to_torch_batch(tensors_pre, device)
             b_post = _stack_to_torch_batch(tensors_post, device)
-            out_cd, out_t1, out_t2 = model(b_pre, b_post)
-            change_mask = torch.argmax(out_cd, dim=1).cpu().numpy()
-            pred_t1 = torch.argmax(out_t1, dim=1).cpu().numpy()
-            pred_t2 = torch.argmax(out_t2, dim=1).cpu().numpy()
-
-            for k, (y0, x0) in enumerate(batch_coords):
-                change_full[y0 : y0 + patch_size, x0 : x0 + patch_size] = change_mask[k]
-                t1_full[y0 : y0 + patch_size, x0 : x0 + patch_size] = pred_t1[k] * change_mask[k]
-                t2_full[y0 : y0 + patch_size, x0 : x0 + patch_size] = pred_t2[k] * change_mask[k]
+            if is_bcd:
+                out = model(b_pre, b_post)
+                change_mask = torch.argmax(out, dim=1).cpu().numpy()
+                for k, (y0, x0) in enumerate(batch_coords):
+                    change_full[y0 : y0 + patch_size, x0 : x0 + patch_size] = change_mask[k]
+            else:
+                out_cd, out_t1, out_t2 = model(b_pre, b_post)
+                change_mask = torch.argmax(out_cd, dim=1).cpu().numpy()
+                pred_t1 = torch.argmax(out_t1, dim=1).cpu().numpy()
+                pred_t2 = torch.argmax(out_t2, dim=1).cpu().numpy()
+                for k, (y0, x0) in enumerate(batch_coords):
+                    change_full[y0 : y0 + patch_size, x0 : x0 + patch_size] = change_mask[k]
+                    t1_full[y0 : y0 + patch_size, x0 : x0 + patch_size] = pred_t1[k] * change_mask[k]
+                    t2_full[y0 : y0 + patch_size, x0 : x0 + patch_size] = pred_t2[k] * change_mask[k]
             # Force terminal/log update so progress is visible during execution.
             pbar.set_postfix_str(f"tiles {min(start + micro_batch, n_patches)}/{n_patches}", refresh=True)
             sys.stdout.flush()
@@ -1115,36 +1269,48 @@ def run_tiled_inference(
     t1_crop = t1_full[:h0, :w0]
     t2_crop = t2_full[:h0, :w0]
 
-    rgb_t1 = _semantic_rgb(t1_crop, cm)
-    rgb_t2 = _semantic_rgb(t2_crop, cm)
-
     pre_scene_small = _to_display_rgb(_downsample_to_max_side(pre_img, MAX_SCENE_PREVIEW_SIDE))
     post_scene_small = _to_display_rgb(_downsample_to_max_side(post_img, MAX_SCENE_PREVIEW_SIDE))
     cm_scene = _downsample_to_max_side(cm, MAX_SCENE_PREVIEW_SIDE)
-    t1_scene = _downsample_to_max_side(t1_crop, MAX_SCENE_PREVIEW_SIDE)
-    t2_scene = _downsample_to_max_side(t2_crop, MAX_SCENE_PREVIEW_SIDE)
     scene_change_overlay = _change_overlay(post_scene_small, cm_scene)
-    scene_sem_t1_overlay = _semantic_overlay(pre_scene_small, t1_scene, cm_scene)
-    scene_sem_t2_overlay = _semantic_overlay(post_scene_small, t2_scene, cm_scene)
-    patch_samples, patch_gallery = _build_patch_visuals(
-        pre_img,
-        post_img,
-        cm,
-        t1_crop,
-        t2_crop,
-        patch_size,
-        nh,
-        nw,
-        scene_change_overlay,
-    )
+
+    if is_bcd:
+        scene_sem_t1_overlay = None
+        scene_sem_t2_overlay = None
+        rgb_t1 = None
+        rgb_t2 = None
+        patch_samples, patch_gallery = _build_patch_visuals_bcd(
+            pre_img, post_img, cm, patch_size, nh, nw, scene_change_overlay
+        )
+    else:
+        rgb_t1 = _semantic_rgb(t1_crop, cm)
+        rgb_t2 = _semantic_rgb(t2_crop, cm)
+        t1_scene = _downsample_to_max_side(t1_crop, MAX_SCENE_PREVIEW_SIDE)
+        t2_scene = _downsample_to_max_side(t2_crop, MAX_SCENE_PREVIEW_SIDE)
+        scene_sem_t1_overlay = _semantic_overlay(pre_scene_small, t1_scene, cm_scene)
+        scene_sem_t2_overlay = _semantic_overlay(post_scene_small, t2_scene, cm_scene)
+        patch_samples, patch_gallery = _build_patch_visuals(
+            pre_img,
+            post_img,
+            cm,
+            t1_crop,
+            t2_crop,
+            patch_size,
+            nh,
+            nw,
+            scene_change_overlay,
+        )
     patch_labels = list(patch_samples.keys())
+    pred_lbl = _patch_pred_label()
     if patch_labels:
         patch_dropdown = gr.update(choices=patch_labels, value=patch_labels[0])
-        patch_scene, patch_inputs, patch_preds, patch_info = show_patch_details(patch_labels[0])
+        patch_scene, patch_inputs, patch_preds_arr, patch_info = show_patch_details(patch_labels[0])
+        patch_preds = gr.update(value=patch_preds_arr, label=pred_lbl)
     else:
         patch_dropdown, patch_scene, patch_inputs, patch_preds, patch_gallery, patch_info = _empty_patch_outputs()
 
-    out_root = Path((out_dir or "").strip() or str(_PROJECT_ROOT / "outputs" / "gradio_scd"))
+    default_out = "gradio_bcd" if is_bcd else "gradio_scd"
+    out_root = Path((out_dir or "").strip() or str(_PROJECT_ROOT / "outputs" / default_out))
     out_root.mkdir(parents=True, exist_ok=True)
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_run = out_root / run_ts
@@ -1154,36 +1320,52 @@ def run_tiled_inference(
     p_t1 = out_run / f"{stem}_pred_semantic_T1.png"
     p_t2 = out_run / f"{stem}_pred_semantic_T2.png"
     imageio.imwrite(str(p_change), change_vis)
-    imageio.imwrite(str(p_t1), rgb_t1)
-    imageio.imwrite(str(p_t2), rgb_t2)
+    saved_lines = [f"- {p_change}"]
+    if not is_bcd:
+        assert rgb_t1 is not None and rgb_t2 is not None
+        imageio.imwrite(str(p_t1), rgb_t1)
+        imageio.imwrite(str(p_t2), rgb_t2)
+        saved_lines.append(f"- {p_t1}")
+        saved_lines.append(f"- {p_t2}")
     infer_shp_msg = ""
-    try:
-        shp_path, feature_count = _export_pred_unified_shapefile(
-            cm,
-            t1_crop,
-            t2_crop,
-            ref_raster_path=ref_raster_path,
-            out_dir=str(out_run),
-            stem=stem,
-        )
+    if is_bcd:
         infer_shp_msg = (
             "\n\n[Vector export]\n"
-            "Status: OK\n"
-            f"Shapefile: {shp_path}\n"
-            f"Features: {feature_count}\n"
-            "Fields: change, scd_cls, t1_cls, t2_cls"
+            "Status: SKIPPED (BCD mode)\n"
+            "Unified SCD shapefile export needs semantic T1/T2 maps; use SCD mode for that export."
         )
-    except Exception as e:
-        infer_shp_msg = (
-            "\n\n[Vector export]\n"
-            "Status: SKIPPED\n"
-            f"Reason: {e}"
-        )
+    else:
+        try:
+            shp_path, feature_count = _export_pred_unified_shapefile(
+                cm,
+                t1_crop,
+                t2_crop,
+                ref_raster_path=ref_raster_path,
+                out_dir=str(out_run),
+                stem=stem,
+            )
+            infer_shp_msg = (
+                "\n\n[Vector export]\n"
+                "Status: OK\n"
+                f"Shapefile: {shp_path}\n"
+                f"Features: {feature_count}\n"
+                "Fields: change, scd_cls, t1_cls, t2_cls"
+            )
+        except Exception as e:
+            infer_shp_msg = (
+                "\n\n[Vector export]\n"
+                "Status: SKIPPED\n"
+                f"Reason: {e}"
+            )
 
     _SESSION.ref_raster_path = ref_raster_path
     _SESSION.pred_change_mask = cm.copy()
-    _SESSION.pred_sem_t1 = t1_crop.copy()
-    _SESSION.pred_sem_t2 = t2_crop.copy()
+    if is_bcd:
+        _SESSION.pred_sem_t1 = None
+        _SESSION.pred_sem_t2 = None
+    else:
+        _SESSION.pred_sem_t1 = t1_crop.copy()
+        _SESSION.pred_sem_t2 = t2_crop.copy()
     _SESSION.image_hw = (h0, w0)
     _SESSION.patch_grid = (nh, nw)
     _SESSION.scene_t1_preview = pre_scene_small
@@ -1196,11 +1378,13 @@ def run_tiled_inference(
     _SESSION.last_out_dir = str(out_run)
     _SESSION.last_stem = stem
 
+    mode_note = "BCD (binary change only)" if is_bcd else "SCD (change + semantics)"
     status_tail = (
-        f"Input scene: {h0}x{w0}px, patch grid: {nh} x {nw} ({n_patches} tiles), patch size: {patch_size}px, micro-batch: {micro_batch}\n"
+        f"Mode: **{mode_note}**. Input scene: {h0}x{w0}px, patch grid: {nh} x {nw} ({n_patches} tiles), "
+        f"patch size: {patch_size}px, micro-batch: {micro_batch}\n"
         f"Outputs folder (timestamped): {out_run}\n"
-        "UI view: downsampled scene previews + representative patch explorer for large-image inspection.\n\n"
-        f"Saved:\n- {p_change}\n- {p_t1}\n- {p_t2}{infer_shp_msg}\n\n"
+        "UI view: downsampled full-scene context + representative patch explorer.\n\n"
+        f"Saved:\n" + "\n".join(saved_lines) + f"{infer_shp_msg}\n\n"
         "Predictions are cached for **Evaluate** (same pixel grid as this run, unpadded)."
     )
     if grid_notes:
@@ -1208,15 +1392,20 @@ def run_tiled_inference(
     if alignment_note:
         status_tail = f"{alignment_note}\n\n{status_tail}"
 
+    sem1_vis = gr.update(value=scene_sem_t1_overlay, visible=not is_bcd)
+    sem2_vis = gr.update(value=scene_sem_t2_overlay, visible=not is_bcd)
+    sem1_saved = gr.update(value=rgb_t1, visible=not is_bcd)
+    sem2_saved = gr.update(value=rgb_t2, visible=not is_bcd)
+
     yield (
         pre_scene_small,
         post_scene_small,
         scene_change_overlay,
-        scene_sem_t1_overlay,
-        scene_sem_t2_overlay,
+        sem1_vis,
+        sem2_vis,
         np.stack([change_vis] * 3, axis=-1),
-        rgb_t1,
-        rgb_t2,
+        sem1_saved,
+        sem2_saved,
         patch_dropdown,
         patch_scene,
         patch_inputs,
@@ -1260,17 +1449,64 @@ def run_evaluation(
     cm = _SESSION.pred_change_mask
     t1_crop = _SESSION.pred_sem_t1
     t2_crop = _SESSION.pred_sem_t2
-    assert t1_crop is not None and t2_crop is not None
+    is_bcd = _SESSION.task_mode == "bcd"
 
     gt_cd_s = (gt_cd_path or "").strip()
     gt_t1_s = (gt_t1_path or "").strip()
     gt_t2_s = (gt_t2_path or "").strip()
-    if not (gt_cd_s and gt_t1_s and gt_t2_s):
-        return "", "Provide all three paths: GT_CD, GT_T1, and GT_T2."
+    if is_bcd:
+        if not gt_cd_s:
+            return "", "Provide **GT_CD** (binary change ground truth)."
+    else:
+        if not (gt_cd_s and gt_t1_s and gt_t2_s):
+            return "", "Provide all three paths: GT_CD, GT_T1, and GT_T2."
+        assert t1_crop is not None and t2_crop is not None
 
     h0, w0 = cm.shape[:2]
     ref_grid = _SESSION.ref_raster_path
     vfield = (vector_label_field or "").strip() or None
+
+    if is_bcd:
+        try:
+            gt_cd, _gt_t1, _gt_t2 = _load_gt_maps(
+                gt_cd_s,
+                None,
+                None,
+                (h0, w0),
+                ref_raster_path=ref_grid,
+                vector_label_field=vfield,
+            )
+        except Exception as e:
+            return "", str(e)
+        if gt_cd is None:
+            return "", "Failed to load GT_CD."
+        labels_cd = (gt_cd > 0.5).astype(np.int32)
+        preds_cd = (cm > 0).astype(np.int32)
+        ev = Evaluator(num_class=2)
+        ev.add_batch(labels_cd, preds_cd)
+        oa = ev.Pixel_Accuracy()
+        f1 = ev.Pixel_F1_score()
+        iou = ev.Intersection_over_Union()
+        pre = ev.Pixel_Precision_Rate()
+        rec = ev.Pixel_Recall_Rate()
+        kc = ev.Kappa_coefficient()
+        metrics_md = (
+            "| Metric (binary change) | Value |\n|:---|---:|\n"
+            f"| OA | {oa:.4f} |\n"
+            f"| Precision | {pre:.4f} |\n"
+            f"| Recall | {rec:.4f} |\n"
+            f"| F1 | {f1:.4f} |\n"
+            f"| IoU (change) | {iou:.4f} |\n"
+            f"| Kappa | {kc:.4f} |\n"
+        )
+        shp_msg = (
+            "\n\n[Vector export]\n"
+            "Status: SKIPPED (BCD evaluation — no unified SCD shapefile)\n"
+            "Use SCD mode if you need the combined vector export."
+        )
+        status = f"Evaluated binary change on {h0}×{w0}px.{shp_msg}"
+        return metrics_md, status
+
     try:
         gt_cd, gt_t1, gt_t2 = _load_gt_maps(
             gt_cd_s,
@@ -1349,10 +1585,11 @@ def _run_evaluation_from_data(
     missing: list[str] = []
     if not gt_cd_rel or not gt_cd:
         missing.append("GT_CD")
-    if not gt_t1_rel or not gt_t1:
-        missing.append("GT_T1")
-    if not gt_t2_rel or not gt_t2:
-        missing.append("GT_T2")
+    if _SESSION.task_mode != "bcd":
+        if not gt_t1_rel or not gt_t1:
+            missing.append("GT_T1")
+        if not gt_t2_rel or not gt_t2:
+            missing.append("GT_T2")
     if missing:
         return "", f"Choose valid files for: {', '.join(missing)} (paths must exist under data/)."
     return run_evaluation(gt_cd, gt_t1, gt_t2, vector_label_field)
@@ -1371,6 +1608,45 @@ def _refresh_data_dropdowns():
     )
 
 
+def _on_task_mode_change(mode: str):
+    """Toggle labels and visibility when user switches SCD vs BCD before loading a model."""
+    scd = (mode or "").strip().lower() != "bcd"
+    ck_lbl = "Trained SCD checkpoint (optional)" if scd else "Trained BCD checkpoint (optional)"
+    ck_ph = (
+        "ChangeMambaSCD .pth — clear to load backbone only"
+        if scd
+        else "ChangeMambaBCD .pth (e.g. MambaBCD_Tiny_*.pth) — clear for backbone only"
+    )
+    eval_intro_scd = (
+        "Use this tab after **Inference** finishes. Predictions from the last run are cached for metrics and shapefile export.\n\n"
+        "**SCD mode:** provide GT_CD, GT_T1, and GT_T2. Metrics follow the **37-class SCD** encoding from training.\n\n"
+        "GT rasters must match **prediction resolution** (same grid as inference). "
+        "Vector GT is rasterized onto the **reference raster** from that run (T1 path if T2→T1, else T2).\n\n"
+        "**Refresh data files** on the Inference tab updates the GT dropdowns here too."
+    )
+    eval_intro_bcd = (
+        "Use this tab after **Inference** with a **BCD** model. Only **GT_CD** (binary change) is required; "
+        "GT_T1 / GT_T2 and the vector label field are hidden and ignored.\n\n"
+        "Metrics: OA, precision, recall, F1, IoU, and Kappa on the change class (same style as `infer_MambaBCD`).\n\n"
+        "**Refresh data files** on the Inference tab updates the GT dropdowns here too."
+    )
+    patch_lbl = (
+        "Patch predictions (change | semantic T1 | semantic T2)"
+        if scd
+        else "Patch prediction (binary change on T2)"
+    )
+    return (
+        gr.update(label=ck_lbl, placeholder=ck_ph),
+        gr.update(visible=scd),
+        gr.update(visible=scd),
+        gr.update(visible=scd),
+        gr.update(visible=scd),
+        gr.update(visible=scd),
+        gr.update(label=patch_lbl),
+        gr.update(value=eval_intro_scd if scd else eval_intro_bcd),
+    )
+
+
 def build_app():
     default_cfg = str(
         Path(__file__).resolve().parent
@@ -1383,24 +1659,29 @@ def build_app():
     data_choices = _scan_data_file_choices()
     default_t1, default_t2 = _pick_default_t1_t2(data_choices)
 
-    with gr.Blocks(title="ChangeMamba SCD — large-image tiled inference", theme=gr.themes.Default()) as demo:
+    with gr.Blocks(title="ChangeMamba — large-image change detection (SCD / BCD)", theme=gr.themes.Default()) as demo:
         gr.Markdown(
-            "## Large-image semantic change detection\n"
-            "1. **Load model** → 2. **Run tiled inference** (default 256×256 patches) → saves maps and caches preds → "
-            "3. **Evaluate vs GT** on the **Evaluation** tab (optional).\n\n"
+            "## Large-image change detection (SCD or BCD)\n"
+            "Pick **task mode** below, then **Load model** with the matching **ChangeMambaSCD** or **ChangeMambaBCD** weights. "
+            "1. **Load model** → 2. **Run tiled inference** (default 256×256 patches) → 3. **Evaluate vs GT** (optional).\n\n"
             f"T1, T2, and GT inputs are **dropdowns** over files under **`data/`** (see `{_DATA_ROOT}`). "
             "Supported: common image/geo rasters and `.shp`. Use **Refresh data files** after adding assets.\n\n"
-            "The viewer is optimized for very large rasters: it shows **downsampled full-scene context** for T1/T2, "
-            "**prediction overlays** that are easier to read than raw stitched masks, and a **representative patch explorer** "
-            "that surfaces the most changed tiles so users can inspect local evidence without opening the saved files manually.\n\n"
-            f"Class legend uses **{NUM_CLASSES}** JL1 semantic indices (0–5). "
-            "Metrics use the **37-class SCD** encoding from training (`train_MambaSCD` validation). "
+            "**SCD** shows semantic overlays on T1/T2 and saves colored semantic maps plus optional unified shapefile export. "
+            "**BCD** shows only the **binary change** overlay and patch cards (no semantic prediction panels); "
+            "evaluation needs **GT_CD** only.\n\n"
+            f"In SCD mode, the JL1 class legend uses **{NUM_CLASSES}** semantic indices (0–5). "
+            "SCD metrics use the **37-class** encoding from training. "
             "GT rasters must match **prediction resolution** (unpadded image size; same grid as the chosen alignment). "
-            "Vector GT (**`.shp`** or a folder containing one shapefile) is rasterized with **rasterio** "
-            "onto the **reference image grid** from the last inference (T1 GeoTIFF if you aligned T2→T1, else T2). "
-            "Install **`pip install rasterio fiona`** if you use shapefiles. "
-            "Semantic shapefiles need an integer class field (JL1 indices 0–5); set **Vector label field** "
-            "if the attribute name is not detected automatically."
+            "Vector GT is rasterized with **rasterio** onto the **reference image grid** from the last inference. "
+            "Install **`pip install rasterio fiona`** if you use shapefiles."
+        )
+        task_mode = gr.Radio(
+            label="Task mode (before Load model)",
+            choices=[
+                ("Semantic change detection (ChangeMambaSCD)", "scd"),
+                ("Binary change detection (ChangeMambaBCD)", "bcd"),
+            ],
+            value="scd",
         )
         with gr.Tabs():
             with gr.Tab("Inference"):
@@ -1413,7 +1694,7 @@ def build_app():
                 ckpt_in = gr.Textbox(
                     label="Trained SCD checkpoint (optional)",
                     value=_DEFAULT_SCD_CHECKPOINT,
-                    placeholder="best_model.pth or step checkpoint — clear to load backbone only",
+                    placeholder="ChangeMambaSCD .pth — clear to load backbone only",
                 )
                 cuda_chk = gr.Checkbox(label="Use CUDA", value=True)
                 load_btn = gr.Button("Load model", variant="primary")
@@ -1450,18 +1731,21 @@ def build_app():
                 )
                 psz = gr.Number(label="Patch size (px)", value=256, precision=0)
                 mb = gr.Number(label="Micro-batch (patches per forward)", value=4, precision=0)
-                odir = gr.Textbox(label="Output directory", placeholder="default: <repo>/outputs/gradio_scd")
+                odir = gr.Textbox(
+                    label="Output directory",
+                    placeholder="default: <repo>/outputs/gradio_scd or gradio_bcd from task mode",
+                )
                 run_btn = gr.Button("Run tiled inference", variant="primary")
                 class_legend = ", ".join(f"{idx}: {name}" for idx, name in enumerate(JL1_CLASSES))
-                gr.Markdown(f"**JL1 legend** — {class_legend}")
+                jl1_legend_md = gr.Markdown(f"**JL1 legend (SCD only)** — {class_legend}")
                 with gr.Accordion("Large-scene viewer", open=True):
                     with gr.Row():
                         scene_t1_prev = gr.Image(label="T1 overview (downsampled)", type="numpy")
                         scene_t2_prev = gr.Image(label="T2 overview (downsampled)", type="numpy")
                     with gr.Row():
                         scene_change_prev = gr.Image(label="Change overlay on T2", type="numpy")
-                        scene_sem1_prev = gr.Image(label="Semantic overlay on T1", type="numpy")
-                        scene_sem2_prev = gr.Image(label="Semantic overlay on T2", type="numpy")
+                        scene_sem1_prev = gr.Image(label="Semantic overlay on T1 (SCD)", type="numpy")
+                        scene_sem2_prev = gr.Image(label="Semantic overlay on T2 (SCD)", type="numpy")
                 with gr.Accordion("Representative patch explorer", open=True):
                     patch_choice = gr.Dropdown(label="Representative patch", choices=[], value=None, interactive=True)
                     patch_info = gr.Textbox(label="Patch details", lines=5)
@@ -1477,14 +1761,15 @@ def build_app():
                     )
                 with gr.Accordion("Saved stitched outputs", open=False):
                     change_prev = gr.Image(label="Predicted change map (stitched)", type="numpy")
-                    sem1_prev = gr.Image(label="Predicted semantic T1 (colored)", type="numpy")
-                    sem2_prev = gr.Image(label="Predicted semantic T2 (colored)", type="numpy")
+                    sem1_prev = gr.Image(label="Predicted semantic T1 (colored, SCD)", type="numpy")
+                    sem2_prev = gr.Image(label="Predicted semantic T2 (colored, SCD)", type="numpy")
                 out_path = gr.Textbox(label="Output folder used")
                 run_status = gr.Textbox(label="Inference log", lines=6)
 
             with gr.Tab("Evaluation"):
-                gr.Markdown(
+                eval_intro = gr.Markdown(
                     "Use this tab after **Inference** finishes. Predictions from the last run are cached for metrics and shapefile export.\n\n"
+                    "**SCD mode:** provide GT_CD, GT_T1, and GT_T2. Metrics follow the **37-class SCD** encoding from training.\n\n"
                     "GT rasters must match **prediction resolution** (same grid as inference). "
                     "Vector GT is rasterized onto the **reference raster** from that run (T1 path if T2→T1, else T2).\n\n"
                     "**Refresh data files** on the Inference tab updates the GT dropdowns here too."
@@ -1516,7 +1801,21 @@ def build_app():
                 metrics = gr.Markdown()
                 eval_status = gr.Textbox(label="Evaluation log", lines=8)
 
-        load_btn.click(load_model_fn, [cfg_in, pretrain_in, ckpt_in, cuda_chk], load_status)
+        task_mode.change(
+            _on_task_mode_change,
+            task_mode,
+            [
+                ckpt_in,
+                scene_sem1_prev,
+                scene_sem2_prev,
+                sem1_prev,
+                sem2_prev,
+                jl1_legend_md,
+                patch_preds,
+                eval_intro,
+            ],
+        )
+        load_btn.click(load_model_fn, [task_mode, cfg_in, pretrain_in, ckpt_in, cuda_chk], load_status)
         data_refresh.click(
             _refresh_data_dropdowns,
             inputs=None,
@@ -1546,7 +1845,11 @@ def build_app():
                 eval_status,
             ],
         )
-        patch_choice.change(show_patch_details, patch_choice, [patch_scene, patch_inputs, patch_preds, patch_info])
+        patch_choice.change(
+            show_patch_details,
+            patch_choice,
+            [patch_scene, patch_inputs, patch_preds, patch_info],
+        )
         eval_btn.click(_run_evaluation_from_data, [gt_cd, gt_t1, gt_t2, vec_lbl], [metrics, eval_status])
 
     return demo
