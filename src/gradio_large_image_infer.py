@@ -7,8 +7,10 @@ then optionally run a separate evaluation step against GT (two buttons).
 from __future__ import annotations
 
 import argparse
+import socket
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,17 +26,26 @@ import gradio as gr
 from PIL import Image, ImageDraw
 
 try:
+    from tqdm.auto import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):  # type: ignore[no-redef]
+        return iterable
+
+try:
     import fiona
     import rasterio
+    from rasterio.enums import Resampling
     from rasterio import features as rio_features
-    from rasterio.warp import transform_geom
+    from rasterio.warp import reproject, transform_geom
 
     _HAS_RASTERIO = True
 except ImportError:
     _HAS_RASTERIO = False
     fiona = None  # type: ignore
     rasterio = None  # type: ignore
+    Resampling = None  # type: ignore
     rio_features = None  # type: ignore
+    reproject = None  # type: ignore
     transform_geom = None  # type: ignore
 
 from ChangeMamba.changedetection.configs.config import get_config
@@ -48,6 +59,60 @@ NUM_SCD_CLASSES = 37
 MAX_SCENE_PREVIEW_SIDE = 1400
 MAX_PATCH_CARD_SIDE = 320
 MAX_PATCH_SAMPLES = 12
+# Same convention as scripts/infer_val_jl1_visualize.py (JL1 ChangeMambaSCD base weights).
+_DEFAULT_SCD_CHECKPOINT = str(
+    _PROJECT_ROOT / "models" / "BiliSakura" / "JL1-ChangeMambaSCD" / "Base" / "best_model.pth"
+)
+
+_DATA_ROOT = _PROJECT_ROOT / "data"
+_DATA_SELECT_EXTS = frozenset({".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".shp"})
+
+
+def _scan_data_file_choices() -> list[str]:
+    """Paths relative to repo root under data/, suitable for dropdown selection."""
+    root = _DATA_ROOT
+    if not root.is_dir():
+        return []
+    found: list[Path] = []
+    for p in root.rglob("*"):
+        if p.is_file() and p.suffix.lower() in _DATA_SELECT_EXTS:
+            found.append(p)
+    return sorted(str(x.relative_to(_PROJECT_ROOT)) for x in found)
+
+
+def _resolve_project_relative(rel: str | None) -> str:
+    s = (rel or "").strip()
+    if not s:
+        return ""
+    p = (_PROJECT_ROOT / s).resolve()
+    if not p.is_file():
+        return ""
+    return str(p)
+
+
+def _pick_default_t1_t2(choices: list[str]) -> tuple[str | None, str | None]:
+    def in_part(path_str: str, part: str) -> bool:
+        return part in Path(path_str).parts
+
+    t1s = [c for c in choices if in_part(c, "T1")]
+    t2s = [c for c in choices if in_part(c, "T2")]
+    return (t1s[0] if t1s else None, t2s[0] if t2s else None)
+
+
+def _find_free_port(start: int, attempts: int = 32) -> int:
+    """First bindable TCP port in [start, start + attempts). Raises if none free."""
+    for port in range(start, start + attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("", port))
+                return port
+            except OSError:
+                continue
+    raise OSError(
+        f"No free port in {start}–{start + attempts - 1}. "
+        "Set GRADIO_SERVER_PORT or pass --port."
+    )
 
 
 def _load_rgb_f32(path: str) -> np.ndarray:
@@ -62,9 +127,102 @@ def _load_rgb_f32(path: str) -> np.ndarray:
     return img
 
 
+def _resample_rgb_to_ref_grid(
+    ref_raster_path: str,
+    src_raster_path: str,
+    *,
+    ref_label: str = "reference",
+    src_label: str = "source",
+) -> tuple[np.ndarray, str]:
+    """
+    Resample source raster onto reference raster grid (H/W + transform + CRS).
+    Returns HxWx3 float32 and a short alignment note.
+    """
+    if not _HAS_RASTERIO:
+        raise RuntimeError("rasterio is required for geospatial resampling.")
+
+    with rasterio.open(ref_raster_path) as ref_ds, rasterio.open(src_raster_path) as src_ds:  # type: ignore[attr-defined]
+        if ref_ds.crs is None or src_ds.crs is None:
+            raise ValueError(
+                "Both rasters must have CRS metadata for auto-alignment. "
+                "Provide pre-aligned rasters or add CRS to the files."
+            )
+
+        dst_h, dst_w = ref_ds.height, ref_ds.width
+        dst = np.zeros((3, dst_h, dst_w), dtype=np.float32)
+        if src_ds.count >= 3:
+            src_indexes = [1, 2, 3]
+        elif src_ds.count == 2:
+            src_indexes = [1, 2, 2]
+        else:
+            src_indexes = [1, 1, 1]
+
+        for out_ch, src_band_idx in enumerate(src_indexes):
+            reproject(  # type: ignore[misc]
+                source=rasterio.band(src_ds, src_band_idx),  # type: ignore[attr-defined]
+                destination=dst[out_ch],
+                src_transform=src_ds.transform,
+                src_crs=src_ds.crs,
+                dst_transform=ref_ds.transform,
+                dst_crs=ref_ds.crs,
+                resampling=Resampling.bilinear,  # type: ignore[union-attr]
+                dst_nodata=0.0,
+            )
+
+        note = (
+            f"Resampled **{src_label}** onto **{ref_label}** grid (rasterio reproject): "
+            f"{src_ds.height}×{src_ds.width} → {dst_h}×{dst_w} px."
+        )
+        return np.transpose(dst, (1, 2, 0)), note
+
+
+def _raster_native_grid_note(path: str, label: str) -> str:
+    """Best-effort human-readable raster grid/pixel-size note for logs."""
+    if not _HAS_RASTERIO:
+        return ""
+    try:
+        with rasterio.open(path) as ds:  # type: ignore[attr-defined]
+            x_res = float(abs(ds.transform.a))
+            y_res = float(abs(ds.transform.e))
+            unit = "units"
+            if ds.crs is not None:
+                if bool(getattr(ds.crs, "is_geographic", False)):
+                    unit = "deg"
+                else:
+                    linear_units = str(getattr(ds.crs, "linear_units", "") or "").lower()
+                    if "meter" in linear_units or "metre" in linear_units or linear_units == "m":
+                        unit = "m"
+                    elif linear_units:
+                        unit = linear_units
+                    else:
+                        unit = "map-units"
+            return (
+                f"{label} native grid: {ds.height}x{ds.width}px, "
+                f"pixel size: {x_res:.6g} x {y_res:.6g} {unit}/px."
+            )
+    except Exception:
+        return ""
+
+
 def _to_chw_normalized(img_hwc: np.ndarray) -> np.ndarray:
     x = imutils.normalize_img(img_hwc)
     return np.ascontiguousarray(np.transpose(x, (2, 0, 1)))
+
+
+def _stack_to_torch_batch(arrays: list[np.ndarray], device: torch.device) -> torch.Tensor:
+    """
+    Convert list of CHW numpy arrays to a float32 tensor on `device`.
+    Uses robust fallbacks for environments where torch.from_numpy fails with NumPy ABI mismatches.
+    """
+    batch_np = np.ascontiguousarray(np.stack(arrays, axis=0), dtype=np.float32)
+    try:
+        return torch.from_numpy(batch_np).to(device)
+    except Exception:
+        try:
+            return torch.tensor(batch_np, dtype=torch.float32, device=device)
+        except Exception:
+            # Last-resort path avoids NumPy C-API bridge entirely.
+            return torch.tensor(batch_np.tolist(), dtype=torch.float32, device=device)
 
 
 def _pad_pair_to_multiple(
@@ -254,8 +412,8 @@ def _load_gt_maps(
         if _is_vector_gt_path(p):
             if not ref_raster_path:
                 raise ValueError(
-                    f"{name} is vector data (.shp). Run inference with the T1 raster path first "
-                    "so labels can be rasterized to the same grid (or export GT to GeoTIFF/PNG)."
+                    f"{name} is vector data (.shp). Run inference first so labels can be rasterized "
+                    "to the same grid as predictions (or export GT to GeoTIFF/PNG at that resolution)."
                 )
             ref_p = Path(ref_raster_path).expanduser().resolve()
             if not ref_p.is_file():
@@ -278,6 +436,103 @@ def _load_gt_maps(
                 "For rasters, match T1/T2 resolution; for shapefiles, check CRS alignment with the T1 reference."
             )
     return cd, t1, t2
+
+
+def _cleanup_shapefile_sidecars(shp_path: Path) -> None:
+    """Remove existing shapefile sidecars to avoid stale artifacts on rewrite."""
+    stem = shp_path.with_suffix("")
+    for ext in (".shp", ".shx", ".dbf", ".prj", ".cpg"):
+        p = stem.with_suffix(ext)
+        if p.exists():
+            p.unlink()
+
+
+def _export_pred_unified_shapefile(
+    change_mask: np.ndarray,
+    pred_t1: np.ndarray,
+    pred_t2: np.ndarray,
+    *,
+    ref_raster_path: str,
+    out_dir: str,
+    stem: str,
+) -> tuple[Path, int]:
+    """
+    Export one unified shapefile from pixel predictions.
+    Each polygon feature has: change=1, scd_cls, t1_cls, t2_cls.
+    Returns (shapefile_path, feature_count).
+    """
+    if not _HAS_RASTERIO or fiona is None or rio_features is None:
+        raise RuntimeError("Shapefile export requires rasterio and fiona.")
+
+    ref = Path(ref_raster_path).expanduser().resolve()
+    if not ref.is_file():
+        raise FileNotFoundError(f"Reference raster not found for vector export: {ref}")
+
+    out_root = Path(out_dir).expanduser().resolve()
+    out_root.mkdir(parents=True, exist_ok=True)
+    shp_path = out_root / f"{stem}_pred_unified.shp"
+    _cleanup_shapefile_sidecars(shp_path)
+
+    cm = (change_mask > 0).astype(np.uint8)
+    if cm.shape != pred_t1.shape or cm.shape != pred_t2.shape:
+        raise ValueError(
+            f"Prediction map size mismatch for vector export: "
+            f"CM={cm.shape}, T1={pred_t1.shape}, T2={pred_t2.shape}"
+        )
+
+    scd = ((pred_t1.astype(np.int32) - 1) * 6 + pred_t2.astype(np.int32)).astype(np.int32)
+    scd[cm == 0] = 0
+    valid_mask = scd > 0
+
+    with rasterio.open(str(ref)) as ref_ds:  # type: ignore[attr-defined]
+        h0, w0 = scd.shape
+        if (ref_ds.height, ref_ds.width) != (h0, w0):
+            raise ValueError(
+                "Reference raster grid does not match prediction size for vector export: "
+                f"ref={(ref_ds.height, ref_ds.width)}, pred={(h0, w0)}"
+            )
+        transform = ref_ds.transform
+        crs_wkt = ref_ds.crs.to_wkt() if ref_ds.crs is not None else None
+
+        schema = {
+            "geometry": "Polygon",
+            "properties": {
+                "change": "int",
+                "scd_cls": "int",
+                "t1_cls": "int",
+                "t2_cls": "int",
+            },
+        }
+        with fiona.open(  # type: ignore[misc]
+            str(shp_path),
+            mode="w",
+            driver="ESRI Shapefile",
+            schema=schema,
+            crs_wkt=crs_wkt,
+            encoding="UTF-8",
+        ) as dst:
+            feature_count = 0
+            if np.any(valid_mask):
+                for geom, value in rio_features.shapes(scd, mask=valid_mask, transform=transform):
+                    scd_cls = int(value)
+                    if scd_cls <= 0:
+                        continue
+                    t1_cls = (scd_cls - 1) // 6 + 1
+                    t2_cls = (scd_cls - 1) % 6 + 1
+                    dst.write(
+                        {
+                            "geometry": geom,
+                            "properties": {
+                                "change": 1,
+                                "scd_cls": scd_cls,
+                                "t1_cls": t1_cls,
+                                "t2_cls": t2_cls,
+                            },
+                        }
+                    )
+                    feature_count += 1
+
+    return shp_path, feature_count
 
 
 def _semantic_rgb(pred_cls: np.ndarray, change_mask: np.ndarray) -> np.ndarray:
@@ -535,8 +790,8 @@ class Session:
     cfg_path: str = ""
     pretrained_backbone: str | None = None
     checkpoint_path: str | None = None
-    # T1 path from last inference — georeference for rasterizing vector GT (shapefile) in Evaluate
-    ref_t1_path: str | None = None
+    # Georeference raster whose grid matches predictions (T1 file if T2→T1 alignment, else T2)
+    ref_raster_path: str | None = None
     # Cropped to original image size (h0, w0), same as saved previews — for Evaluate
     pred_change_mask: np.ndarray | None = None
     pred_sem_t1: np.ndarray | None = None
@@ -550,13 +805,15 @@ class Session:
     scene_sem_t2_overlay: np.ndarray | None = None
     patch_samples: dict[str, PatchSample] = field(default_factory=dict)
     patch_sample_labels: list[str] = field(default_factory=list)
+    last_out_dir: str | None = None
+    last_stem: str | None = None
 
 
 _SESSION = Session()
 
 
 def _reset_cached_outputs() -> None:
-    _SESSION.ref_t1_path = None
+    _SESSION.ref_raster_path = None
     _SESSION.pred_change_mask = None
     _SESSION.pred_sem_t1 = None
     _SESSION.pred_sem_t2 = None
@@ -569,6 +826,8 @@ def _reset_cached_outputs() -> None:
     _SESSION.scene_sem_t2_overlay = None
     _SESSION.patch_samples.clear()
     _SESSION.patch_sample_labels.clear()
+    _SESSION.last_out_dir = None
+    _SESSION.last_stem = None
 
 
 def _select_patch_samples(
@@ -740,10 +999,10 @@ def run_tiled_inference(
     patch_size: int,
     micro_batch: int,
     out_dir: str,
-    progress: gr.Progress,
+    grid_align: str,
 ):
     if _SESSION.model is None or _SESSION.device is None:
-        yield _empty_inference_outputs("Load the model first (Model tab).")
+        yield _empty_inference_outputs("Load the model first (Inference tab → Model).")
         return
 
     t1_path = (t1_path or "").strip()
@@ -761,6 +1020,12 @@ def run_tiled_inference(
     device = _SESSION.device
     model = _SESSION.model
     _reset_cached_outputs()
+    alignment_note = ""
+    grid_notes = [
+        _raster_native_grid_note(t1_path, "T1"),
+        _raster_native_grid_note(t2_path, "T2"),
+    ]
+    grid_notes = [n for n in grid_notes if n]
 
     try:
         pre_img = _load_rgb_f32(t1_path)
@@ -769,9 +1034,35 @@ def run_tiled_inference(
         yield _empty_inference_outputs(f"Failed to read images: {e}")
         return
 
+    ref_raster_path = t1_path
     if pre_img.shape[:2] != post_img.shape[:2]:
-        yield _empty_inference_outputs(f"T1 shape {pre_img.shape[:2]} != T2 shape {post_img.shape[:2]}.")
-        return
+        mode = (grid_align or "t2_to_t1").strip().lower()
+        if mode not in ("t2_to_t1", "t1_to_t2"):
+            yield _empty_inference_outputs(
+                "When T1 and T2 sizes differ, set **Grid alignment** to "
+                "`t2_to_t1` (resample T2 to T1) or `t1_to_t2` (resample T1 to T2)."
+            )
+            return
+        try:
+            if mode == "t2_to_t1":
+                post_img, alignment_note = _resample_rgb_to_ref_grid(
+                    t1_path, t2_path, ref_label="T1", src_label="T2"
+                )
+                ref_raster_path = t1_path
+            else:
+                pre_img, alignment_note = _resample_rgb_to_ref_grid(
+                    t2_path, t1_path, ref_label="T2", src_label="T1"
+                )
+                ref_raster_path = t2_path
+        except Exception as e:
+            grid_block = "\n".join(grid_notes)
+            extra = f"\n{grid_block}" if grid_block else ""
+            yield _empty_inference_outputs(
+                f"T1 shape {pre_img.shape[:2]} != T2 shape {post_img.shape[:2]}. "
+                "If these look aligned in GIS, they likely have different native pixel grids. "
+                f"Resampling failed ({mode}): {e}{extra}"
+            )
+            return
 
     pre_pad, post_pad, _ = _pad_pair_to_multiple(pre_img, post_img, patch_size)
     H, W = pre_pad.shape[:2]
@@ -783,9 +1074,18 @@ def run_tiled_inference(
     t1_full = np.zeros((H, W), dtype=np.int32)
     t2_full = np.zeros((H, W), dtype=np.int32)
 
-    progress(0.0, desc="Running tiled inference…")
+    n_batches = (len(coords) + micro_batch - 1) // micro_batch
     with torch.no_grad():
-        for start in range(0, len(coords), micro_batch):
+        pbar = tqdm(
+            range(0, len(coords), micro_batch),
+            total=n_batches,
+            desc="Tiled inference",
+            unit="batch",
+            file=sys.stdout,
+            dynamic_ncols=True,
+            leave=True,
+        )
+        for start in pbar:
             batch_coords = coords[start : start + micro_batch]
             tensors_pre = []
             tensors_post = []
@@ -794,8 +1094,8 @@ def run_tiled_inference(
                 crop_post = post_pad[y0 : y0 + patch_size, x0 : x0 + patch_size]
                 tensors_pre.append(_to_chw_normalized(crop_pre))
                 tensors_post.append(_to_chw_normalized(crop_post))
-            b_pre = torch.from_numpy(np.stack(tensors_pre, axis=0)).to(device)
-            b_post = torch.from_numpy(np.stack(tensors_post, axis=0)).to(device)
+            b_pre = _stack_to_torch_batch(tensors_pre, device)
+            b_post = _stack_to_torch_batch(tensors_post, device)
             out_cd, out_t1, out_t2 = model(b_pre, b_post)
             change_mask = torch.argmax(out_cd, dim=1).cpu().numpy()
             pred_t1 = torch.argmax(out_t1, dim=1).cpu().numpy()
@@ -805,9 +1105,9 @@ def run_tiled_inference(
                 change_full[y0 : y0 + patch_size, x0 : x0 + patch_size] = change_mask[k]
                 t1_full[y0 : y0 + patch_size, x0 : x0 + patch_size] = pred_t1[k] * change_mask[k]
                 t2_full[y0 : y0 + patch_size, x0 : x0 + patch_size] = pred_t2[k] * change_mask[k]
-
-            frac = min(1.0, (start + len(batch_coords)) / max(1, n_patches))
-            progress(frac, desc=f"Patches {min(start + len(batch_coords), n_patches)}/{n_patches}")
+            # Force terminal/log update so progress is visible during execution.
+            pbar.set_postfix_str(f"tiles {min(start + micro_batch, n_patches)}/{n_patches}", refresh=True)
+            sys.stdout.flush()
 
     h0, w0 = pre_img.shape[0], pre_img.shape[1]
     change_vis = change_full[:h0, :w0].astype(np.uint8) * 255
@@ -846,15 +1146,41 @@ def run_tiled_inference(
 
     out_root = Path((out_dir or "").strip() or str(_PROJECT_ROOT / "outputs" / "gradio_scd"))
     out_root.mkdir(parents=True, exist_ok=True)
+    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_run = out_root / run_ts
+    out_run.mkdir(parents=True, exist_ok=True)
     stem = Path(t1_path).stem
-    p_change = out_root / f"{stem}_pred_GT_CD.png"
-    p_t1 = out_root / f"{stem}_pred_semantic_T1.png"
-    p_t2 = out_root / f"{stem}_pred_semantic_T2.png"
+    p_change = out_run / f"{stem}_pred_GT_CD.png"
+    p_t1 = out_run / f"{stem}_pred_semantic_T1.png"
+    p_t2 = out_run / f"{stem}_pred_semantic_T2.png"
     imageio.imwrite(str(p_change), change_vis)
     imageio.imwrite(str(p_t1), rgb_t1)
     imageio.imwrite(str(p_t2), rgb_t2)
+    infer_shp_msg = ""
+    try:
+        shp_path, feature_count = _export_pred_unified_shapefile(
+            cm,
+            t1_crop,
+            t2_crop,
+            ref_raster_path=ref_raster_path,
+            out_dir=str(out_run),
+            stem=stem,
+        )
+        infer_shp_msg = (
+            "\n\n[Vector export]\n"
+            "Status: OK\n"
+            f"Shapefile: {shp_path}\n"
+            f"Features: {feature_count}\n"
+            "Fields: change, scd_cls, t1_cls, t2_cls"
+        )
+    except Exception as e:
+        infer_shp_msg = (
+            "\n\n[Vector export]\n"
+            "Status: SKIPPED\n"
+            f"Reason: {e}"
+        )
 
-    _SESSION.ref_t1_path = t1_path
+    _SESSION.ref_raster_path = ref_raster_path
     _SESSION.pred_change_mask = cm.copy()
     _SESSION.pred_sem_t1 = t1_crop.copy()
     _SESSION.pred_sem_t2 = t2_crop.copy()
@@ -867,13 +1193,20 @@ def run_tiled_inference(
     _SESSION.scene_sem_t2_overlay = scene_sem_t2_overlay
     _SESSION.patch_samples = patch_samples
     _SESSION.patch_sample_labels = patch_labels
+    _SESSION.last_out_dir = str(out_run)
+    _SESSION.last_stem = stem
 
     status_tail = (
         f"Input scene: {h0}x{w0}px, patch grid: {nh} x {nw} ({n_patches} tiles), patch size: {patch_size}px, micro-batch: {micro_batch}\n"
+        f"Outputs folder (timestamped): {out_run}\n"
         "UI view: downsampled scene previews + representative patch explorer for large-image inspection.\n\n"
-        f"Saved:\n- {p_change}\n- {p_t1}\n- {p_t2}\n\n"
-        "Predictions are cached for **Evaluate** (same resolution as T1/T2, unpadded)."
+        f"Saved:\n- {p_change}\n- {p_t1}\n- {p_t2}{infer_shp_msg}\n\n"
+        "Predictions are cached for **Evaluate** (same pixel grid as this run, unpadded)."
     )
+    if grid_notes:
+        status_tail = "\n".join(grid_notes) + "\n\n" + status_tail
+    if alignment_note:
+        status_tail = f"{alignment_note}\n\n{status_tail}"
 
     yield (
         pre_scene_small,
@@ -890,11 +1223,29 @@ def run_tiled_inference(
         patch_preds,
         patch_gallery,
         patch_info,
-        str(out_root),
+        str(out_run),
         status_tail,
         "",
         "",
     )
+
+
+def _run_tiled_inference_from_data(
+    t1_rel: str,
+    t2_rel: str,
+    patch_size: int,
+    micro_batch: int,
+    out_dir: str,
+    grid_align: str,
+):
+    t1 = _resolve_project_relative(t1_rel)
+    t2 = _resolve_project_relative(t2_rel)
+    if not t1 or not t2:
+        yield _empty_inference_outputs(
+            "Pick **T1** and **T2** from the data folder list (click **Refresh data files** if the list is empty)."
+        )
+        return
+    yield from run_tiled_inference(t1, t2, patch_size, micro_batch, out_dir, grid_align)
 
 
 def run_evaluation(
@@ -918,7 +1269,7 @@ def run_evaluation(
         return "", "Provide all three paths: GT_CD, GT_T1, and GT_T2."
 
     h0, w0 = cm.shape[:2]
-    ref_t1 = _SESSION.ref_t1_path
+    ref_grid = _SESSION.ref_raster_path
     vfield = (vector_label_field or "").strip() or None
     try:
         gt_cd, gt_t1, gt_t2 = _load_gt_maps(
@@ -926,7 +1277,7 @@ def run_evaluation(
             gt_t1_s,
             gt_t2_s,
             (h0, w0),
-            ref_raster_path=ref_t1,
+            ref_raster_path=ref_grid,
             vector_label_field=vfield,
         )
     except Exception as e:
@@ -954,10 +1305,70 @@ def run_evaluation(
         f"| mIoU (binary change) | {IoU_mean:.4f} |\n"
         f"| SeK | {Sek:.4f} |\n"
     )
-    status = (
-        f"Evaluated on {h0}×{w0} (SCD 37-class encoding, same as training validation)."
-    )
+    shp_msg = ""
+    try:
+        if not ref_grid:
+            raise ValueError("Missing reference raster path from inference cache.")
+        out_dir = _SESSION.last_out_dir or str(_PROJECT_ROOT / "outputs" / "gradio_scd")
+        stem = _SESSION.last_stem or Path(ref_grid).stem
+        shp_path, feature_count = _export_pred_unified_shapefile(
+            cm,
+            t1_crop,
+            t2_crop,
+            ref_raster_path=ref_grid,
+            out_dir=out_dir,
+            stem=stem,
+        )
+        shp_msg = (
+            "\n\n[Vector export]\n"
+            f"Status: OK\n"
+            f"Shapefile: {shp_path}\n"
+            f"Features: {feature_count}\n"
+            "Fields: change, scd_cls, t1_cls, t2_cls"
+        )
+    except Exception as e:
+        shp_msg = (
+            "\n\n[Vector export]\n"
+            "Status: SKIPPED\n"
+            f"Reason: {e}"
+        )
+
+    status = f"Evaluated on {h0}×{w0} (SCD 37-class encoding, same as training validation).{shp_msg}"
     return metrics_md, status
+
+
+def _run_evaluation_from_data(
+    gt_cd_rel: str,
+    gt_t1_rel: str,
+    gt_t2_rel: str,
+    vector_label_field: str,
+):
+    gt_cd = _resolve_project_relative(gt_cd_rel)
+    gt_t1 = _resolve_project_relative(gt_t1_rel)
+    gt_t2 = _resolve_project_relative(gt_t2_rel)
+    missing: list[str] = []
+    if not gt_cd_rel or not gt_cd:
+        missing.append("GT_CD")
+    if not gt_t1_rel or not gt_t1:
+        missing.append("GT_T1")
+    if not gt_t2_rel or not gt_t2:
+        missing.append("GT_T2")
+    if missing:
+        return "", f"Choose valid files for: {', '.join(missing)} (paths must exist under data/)."
+    return run_evaluation(gt_cd, gt_t1, gt_t2, vector_label_field)
+
+
+def _refresh_data_dropdowns():
+    ch = _scan_data_file_choices()
+    d1, d2 = _pick_default_t1_t2(ch)
+    return (
+        gr.update(choices=ch, value=d1),
+        gr.update(choices=ch, value=d2),
+        gr.update(choices=ch, value=None),
+        gr.update(choices=ch, value=None),
+        gr.update(choices=ch, value=None),
+        f"Scanned **{len(ch)}** selectable file(s) under `data/` (geo rasters and `.shp`).",
+    )
 
 
 def build_app():
@@ -969,37 +1380,74 @@ def build_app():
         / "vssm1"
         / "vssm_base_224.yaml"
     )
+    data_choices = _scan_data_file_choices()
+    default_t1, default_t2 = _pick_default_t1_t2(data_choices)
 
-    with gr.Blocks(title="ChangeMamba SCD — large-image tiled inference") as demo:
+    with gr.Blocks(title="ChangeMamba SCD — large-image tiled inference", theme=gr.themes.Default()) as demo:
         gr.Markdown(
             "## Large-image semantic change detection\n"
             "1. **Load model** → 2. **Run tiled inference** (default 256×256 patches) → saves maps and caches preds → "
-            "3. **Evaluate vs GT** (optional, second button).\n\n"
+            "3. **Evaluate vs GT** on the **Evaluation** tab (optional).\n\n"
+            f"T1, T2, and GT inputs are **dropdowns** over files under **`data/`** (see `{_DATA_ROOT}`). "
+            "Supported: common image/geo rasters and `.shp`. Use **Refresh data files** after adding assets.\n\n"
             "The viewer is optimized for very large rasters: it shows **downsampled full-scene context** for T1/T2, "
             "**prediction overlays** that are easier to read than raw stitched masks, and a **representative patch explorer** "
             "that surfaces the most changed tiles so users can inspect local evidence without opening the saved files manually.\n\n"
             f"Class legend uses **{NUM_CLASSES}** JL1 semantic indices (0–5). "
             "Metrics use the **37-class SCD** encoding from training (`train_MambaSCD` validation). "
-            "GT rasters must match **T1/T2 resolution** (unpadded image size). "
+            "GT rasters must match **prediction resolution** (unpadded image size; same grid as the chosen alignment). "
             "Vector GT (**`.shp`** or a folder containing one shapefile) is rasterized with **rasterio** "
-            "onto the **T1 image grid** from the last inference (same CRS as the T1 GeoTIFF/raster). "
+            "onto the **reference image grid** from the last inference (T1 GeoTIFF if you aligned T2→T1, else T2). "
             "Install **`pip install rasterio fiona`** if you use shapefiles. "
             "Semantic shapefiles need an integer class field (JL1 indices 0–5); set **Vector label field** "
             "if the attribute name is not detected automatically."
         )
         with gr.Tabs():
-            with gr.Tab("Model"):
+            with gr.Tab("Inference"):
+                gr.Markdown("### Model")
                 cfg_in = gr.Textbox(label="Config YAML", value=default_cfg)
-                pretrain_in = gr.Textbox(label="Backbone pretrained checkpoint (optional)", placeholder="path to ImageNet backbone .pth")
-                ckpt_in = gr.Textbox(label="Trained SCD checkpoint (optional)", placeholder="best_model.pth or step checkpoint")
+                pretrain_in = gr.Textbox(
+                    label="Backbone pretrained checkpoint (optional)",
+                    placeholder="path to ImageNet backbone .pth",
+                )
+                ckpt_in = gr.Textbox(
+                    label="Trained SCD checkpoint (optional)",
+                    value=_DEFAULT_SCD_CHECKPOINT,
+                    placeholder="best_model.pth or step checkpoint — clear to load backbone only",
+                )
                 cuda_chk = gr.Checkbox(label="Use CUDA", value=True)
                 load_btn = gr.Button("Load model", variant="primary")
-                load_status = gr.Textbox(label="Status", lines=3)
-                load_btn.click(load_model_fn, [cfg_in, pretrain_in, ckpt_in, cuda_chk], load_status)
+                load_status = gr.Textbox(label="Model status", lines=3)
 
-            with gr.Tab("Inference"):
-                t1 = gr.Textbox(label="T1 image path (before)", placeholder="/data/.../T1/large.tif")
-                t2 = gr.Textbox(label="T2 image path (after)", placeholder="/data/.../T2/large.tif")
+                gr.Markdown("### Data & tiled inference")
+                with gr.Row():
+                    data_refresh = gr.Button("Refresh data files")
+                    data_scan_status = gr.Markdown(
+                        value=(
+                            f"**{len(data_choices)}** selectable file(s) under `data/`. "
+                            "Defaults prefer paths whose folders are named `T1` / `T2`."
+                        )
+                    )
+                t1 = gr.Dropdown(
+                    label="T1 image (before) — from data/",
+                    choices=data_choices,
+                    value=default_t1,
+                    allow_custom_value=False,
+                )
+                t2 = gr.Dropdown(
+                    label="T2 image (after) — from data/",
+                    choices=data_choices,
+                    value=default_t2,
+                    allow_custom_value=False,
+                )
+                grid_align = gr.Radio(
+                    label="When T1 and T2 pixel grids differ (height×width)",
+                    choices=[
+                        ("Resample T2 → T1 grid (keep T1 pixels, warp T2)", "t2_to_t1"),
+                        ("Resample T1 → T2 grid (keep T2 pixels, warp T1)", "t1_to_t2"),
+                    ],
+                    value="t2_to_t1",
+                )
                 psz = gr.Number(label="Patch size (px)", value=256, precision=0)
                 mb = gr.Number(label="Micro-batch (patches per forward)", value=4, precision=0)
                 odir = gr.Textbox(label="Output directory", placeholder="default: <repo>/outputs/gradio_scd")
@@ -1020,25 +1468,44 @@ def build_app():
                     patch_scene = gr.Image(label="Patch location in scene", type="numpy")
                     patch_inputs = gr.Image(label="Patch inputs (T1 | T2)", type="numpy")
                     patch_preds = gr.Image(label="Patch predictions (change | semantic T1 | semantic T2)", type="numpy")
-                    patch_gallery = gr.Gallery(label="Representative patch cards", columns=3, rows=2, object_fit="contain", height="auto")
+                    patch_gallery = gr.Gallery(
+                        label="Representative patch cards",
+                        columns=3,
+                        rows=2,
+                        object_fit="contain",
+                        height="auto",
+                    )
                 with gr.Accordion("Saved stitched outputs", open=False):
                     change_prev = gr.Image(label="Predicted change map (stitched)", type="numpy")
                     sem1_prev = gr.Image(label="Predicted semantic T1 (colored)", type="numpy")
                     sem2_prev = gr.Image(label="Predicted semantic T2 (colored)", type="numpy")
                 out_path = gr.Textbox(label="Output folder used")
                 run_status = gr.Textbox(label="Inference log", lines=6)
-                gr.Markdown("### Evaluation (after inference)")
-                gt_cd = gr.Textbox(
-                    label="GT_CD path",
-                    placeholder="…/GT_CD/large.png or …/change.shp (polygons → binary mask)",
+
+            with gr.Tab("Evaluation"):
+                gr.Markdown(
+                    "Use this tab after **Inference** finishes. Predictions from the last run are cached for metrics and shapefile export.\n\n"
+                    "GT rasters must match **prediction resolution** (same grid as inference). "
+                    "Vector GT is rasterized onto the **reference raster** from that run (T1 path if T2→T1, else T2).\n\n"
+                    "**Refresh data files** on the Inference tab updates the GT dropdowns here too."
                 )
-                gt_t1 = gr.Textbox(
-                    label="GT_T1 path",
-                    placeholder="…/GT_T1/large.tif/.png or …/sem_t1.shp",
+                gt_cd = gr.Dropdown(
+                    label="GT_CD — from data/ (raster or .shp → binary mask)",
+                    choices=data_choices,
+                    value=None,
+                    allow_custom_value=False,
                 )
-                gt_t2 = gr.Textbox(
-                    label="GT_T2 path",
-                    placeholder="…/GT_T2/large.tif/.png or …/sem_t2.shp",
+                gt_t1 = gr.Dropdown(
+                    label="GT_T1 semantics — from data/",
+                    choices=data_choices,
+                    value=None,
+                    allow_custom_value=False,
+                )
+                gt_t2 = gr.Dropdown(
+                    label="GT_T2 semantics — from data/",
+                    choices=data_choices,
+                    value=None,
+                    allow_custom_value=False,
                 )
                 vec_lbl = gr.Textbox(
                     label="Vector label field (optional)",
@@ -1047,33 +1514,40 @@ def build_app():
                 )
                 eval_btn = gr.Button("Evaluate vs ground truth", variant="primary")
                 metrics = gr.Markdown()
-                eval_status = gr.Textbox(label="Evaluation log", lines=3)
-                run_btn.click(
-                    run_tiled_inference,
-                    [t1, t2, psz, mb, odir],
-                    [
-                        scene_t1_prev,
-                        scene_t2_prev,
-                        scene_change_prev,
-                        scene_sem1_prev,
-                        scene_sem2_prev,
-                        change_prev,
-                        sem1_prev,
-                        sem2_prev,
-                        patch_choice,
-                        patch_scene,
-                        patch_inputs,
-                        patch_preds,
-                        patch_gallery,
-                        patch_info,
-                        out_path,
-                        run_status,
-                        metrics,
-                        eval_status,
-                    ],
-                )
-                patch_choice.change(show_patch_details, patch_choice, [patch_scene, patch_inputs, patch_preds, patch_info])
-                eval_btn.click(run_evaluation, [gt_cd, gt_t1, gt_t2, vec_lbl], [metrics, eval_status])
+                eval_status = gr.Textbox(label="Evaluation log", lines=8)
+
+        load_btn.click(load_model_fn, [cfg_in, pretrain_in, ckpt_in, cuda_chk], load_status)
+        data_refresh.click(
+            _refresh_data_dropdowns,
+            inputs=None,
+            outputs=[t1, t2, gt_cd, gt_t1, gt_t2, data_scan_status],
+        )
+        run_btn.click(
+            _run_tiled_inference_from_data,
+            [t1, t2, psz, mb, odir, grid_align],
+            [
+                scene_t1_prev,
+                scene_t2_prev,
+                scene_change_prev,
+                scene_sem1_prev,
+                scene_sem2_prev,
+                change_prev,
+                sem1_prev,
+                sem2_prev,
+                patch_choice,
+                patch_scene,
+                patch_inputs,
+                patch_preds,
+                patch_gallery,
+                patch_info,
+                out_path,
+                run_status,
+                metrics,
+                eval_status,
+            ],
+        )
+        patch_choice.change(show_patch_details, patch_choice, [patch_scene, patch_inputs, patch_preds, patch_info])
+        eval_btn.click(_run_evaluation_from_data, [gt_cd, gt_t1, gt_t2, vec_lbl], [metrics, eval_status])
 
     return demo
 
@@ -1086,7 +1560,10 @@ def main():
     args = parser.parse_args()
     demo = build_app()
     demo.queue()
-    demo.launch(server_name=args.host, server_port=args.port, share=args.share)
+    port = _find_free_port(args.port)
+    if port != args.port:
+        print(f"Port {args.port} in use; launching on {port}.", file=sys.stderr)
+    demo.launch(server_name=args.host, server_port=port, share=args.share)
 
 
 if __name__ == "__main__":
