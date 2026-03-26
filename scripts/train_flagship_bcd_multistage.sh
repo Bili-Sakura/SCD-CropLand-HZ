@@ -17,6 +17,10 @@
 # Metrics: train/loss every 10 steps; val/* and checkpoint_step_*.pth cadence set by FLAGSHIP_EVAL_INTERVAL / FLAGSHIP_CHECKPOINT_INTERVAL (default 1000 each).
 #
 # Optional env: PYTHON, PROJECT_ROOT, LOG_DIR, RUN_BACKGROUND, FLAGSHIP_CKPT_ROOT
+# HZ BCD metrics (default: full input_quick train+val via train_stage3_input_quick_trainval.txt):
+#   python scripts/eval_bcd_val_checkpoints.py --scan-all-default-dir
+#   python scripts/eval_bcd_val_checkpoints.py --resume-flagship-last-stage 3
+# Val-only (54 tiles): add --hz-pool val
 # Optional: STAGE1_MAX_ITERS (default 1000), STAGE2_MAX_ITERS / STAGE3_MAX_ITERS (default 5000 each)
 # Optional: FLAGSHIP_EVAL_INTERVAL / FLAGSHIP_CHECKPOINT_INTERVAL (default 1000)
 # Optional: STAGE1_YAML, STAGE2_YAML, STAGE3_YAML

@@ -58,6 +58,8 @@ from datasets.colormap import JL1_CLASSES, NUM_CLASSES, index2color
 
 
 NUM_SCD_CLASSES = 37
+# Evaluation-oriented vector export: drop polygonized fragments smaller than this (real-world m²).
+SHAPEFILE_EXPORT_MIN_AREA_M2 = 200.0
 MAX_SCENE_PREVIEW_SIDE = 1400
 MAX_PATCH_CARD_SIDE = 320
 MAX_PATCH_SAMPLES = 12
@@ -451,6 +453,123 @@ def _cleanup_shapefile_sidecars(shp_path: Path) -> None:
             p.unlink()
 
 
+def _ensure_closed_xy_ring(ring: list) -> list:
+    if not ring:
+        return ring
+    if ring[0] != ring[-1]:
+        return ring + [ring[0]]
+    return ring
+
+
+def _signed_planar_ring_area(ring: list) -> float:
+    ring = _ensure_closed_xy_ring(ring)
+    if len(ring) < 4:
+        return 0.0
+    s = 0.0
+    for i in range(len(ring) - 1):
+        x0, y0 = float(ring[i][0]), float(ring[i][1])
+        x1, y1 = float(ring[i + 1][0]), float(ring[i + 1][1])
+        s += x0 * y1 - x1 * y0
+    return s / 2.0
+
+
+def _planar_polygon_area_sq_units(geom: dict) -> float:
+    t = geom.get("type")
+    coords = geom.get("coordinates")
+    if t == "Polygon" and coords:
+        ext = coords[0]
+        holes = coords[1:]
+        a = abs(_signed_planar_ring_area(ext))
+        a -= sum(abs(_signed_planar_ring_area(h)) for h in holes)
+        return max(a, 0.0)
+    if t == "MultiPolygon" and coords:
+        total = 0.0
+        for poly in coords:
+            if not poly:
+                continue
+            ext = poly[0]
+            holes = poly[1:]
+            a = abs(_signed_planar_ring_area(ext))
+            a -= sum(abs(_signed_planar_ring_area(h)) for h in holes)
+            total += max(a, 0.0)
+        return total
+    return 0.0
+
+
+def _geod_polygon_area_m2(geom: dict, geod: Any) -> float:
+    t = geom.get("type")
+    coords = geom.get("coordinates")
+
+    def ring_m2(ring: list) -> float:
+        ring = _ensure_closed_xy_ring(ring)
+        if len(ring) < 4:
+            return 0.0
+        lons = [float(p[0]) for p in ring]
+        lats = [float(p[1]) for p in ring]
+        if lons[0] != lons[-1]:
+            lons.append(lons[0])
+            lats.append(lats[0])
+        a, _ = geod.polygon_area_perimeter(lons, lats)
+        return abs(float(a))
+
+    if t == "Polygon" and coords:
+        ext = coords[0]
+        holes = coords[1:]
+        a = ring_m2(ext) - sum(ring_m2(h) for h in holes)
+        return max(a, 0.0)
+    if t == "MultiPolygon" and coords:
+        total = 0.0
+        for poly in coords:
+            if not poly:
+                continue
+            ext = poly[0]
+            holes = poly[1:]
+            total += ring_m2(ext) - sum(ring_m2(h) for h in holes)
+        return max(total, 0.0)
+    return 0.0
+
+
+def _geojson_geom_area_square_meters(geom: dict, crs: Any) -> float | None:
+    """
+    Area of a GeoJSON-like geometry dict in square metres, or None if CRS/geometry is unusable.
+    Uses geodesic area for geographic CRS and planar × axis unit conversion for projected CRS.
+    """
+    if crs is None:
+        return None
+    try:
+        from pyproj import CRS as PyCRS
+        from pyproj import Geod
+    except ImportError:
+        return None
+    try:
+        pc = PyCRS.from_user_input(crs)
+    except Exception:
+        return None
+    if pc.is_geographic:
+        geod = Geod(ellps="WGS84")
+        return _geod_polygon_area_m2(geom, geod)
+    if pc.is_projected:
+        sq_m_per_sq_unit: float | None = None
+        try:
+            axis = pc.axis_info
+            if axis and axis[0].unit is not None:
+                u = axis[0].unit
+                cf = getattr(u, "conversion_factor", None)
+                if cf is not None:
+                    cf = float(cf)
+                    sq_m_per_sq_unit = cf * cf
+                else:
+                    uname = (getattr(u, "name", "") or "").lower()
+                    if "metre" in uname or "meter" in uname:
+                        sq_m_per_sq_unit = 1.0
+        except Exception:
+            sq_m_per_sq_unit = None
+        if sq_m_per_sq_unit is None:
+            return None
+        return _planar_polygon_area_sq_units(geom) * sq_m_per_sq_unit
+    return None
+
+
 def _export_pred_unified_shapefile(
     change_mask: np.ndarray,
     pred_t1: np.ndarray,
@@ -459,11 +578,14 @@ def _export_pred_unified_shapefile(
     ref_raster_path: str,
     out_dir: str,
     stem: str,
-) -> tuple[Path, int]:
+    min_area_m2: float = SHAPEFILE_EXPORT_MIN_AREA_M2,
+) -> tuple[Path, int, int]:
     """
     Export one unified shapefile from pixel predictions.
     Each polygon feature has: change=1, scd_cls, t1_cls, t2_cls.
-    Returns (shapefile_path, feature_count).
+    Polygons smaller than min_area_m2 (square metres) are omitted when area can be computed;
+    set min_area_m2 <= 0 to disable.
+    Returns (shapefile_path, feature_count_kept, feature_count_dropped_small).
     """
     if not _HAS_RASTERIO or fiona is None or rio_features is None:
         raise RuntimeError("Shapefile export requires rasterio and fiona.")
@@ -497,6 +619,8 @@ def _export_pred_unified_shapefile(
             )
         transform = ref_ds.transform
         crs_wkt = ref_ds.crs.to_wkt() if ref_ds.crs is not None else None
+        ref_crs = ref_ds.crs
+        apply_min_area = min_area_m2 > 0.0
 
         schema = {
             "geometry": "Polygon",
@@ -515,12 +639,18 @@ def _export_pred_unified_shapefile(
             crs_wkt=crs_wkt,
             encoding="UTF-8",
         ) as dst:
-            feature_count = 0
+            kept = 0
+            dropped_small = 0
             if np.any(valid_mask):
                 for geom, value in rio_features.shapes(scd, mask=valid_mask, transform=transform):
                     scd_cls = int(value)
                     if scd_cls <= 0:
                         continue
+                    if apply_min_area:
+                        area_m2 = _geojson_geom_area_square_meters(geom, ref_crs)
+                        if area_m2 is not None and area_m2 < min_area_m2:
+                            dropped_small += 1
+                            continue
                     t1_cls = (scd_cls - 1) // 6 + 1
                     t2_cls = (scd_cls - 1) % 6 + 1
                     dst.write(
@@ -534,9 +664,9 @@ def _export_pred_unified_shapefile(
                             },
                         }
                     )
-                    feature_count += 1
+                    kept += 1
 
-    return shp_path, feature_count
+    return shp_path, kept, dropped_small
 
 
 def _semantic_rgb(pred_cls: np.ndarray, change_mask: np.ndarray) -> np.ndarray:
@@ -1334,7 +1464,7 @@ def run_tiled_inference(
         )
     else:
         try:
-            shp_path, feature_count = _export_pred_unified_shapefile(
+            shp_path, n_kept, n_drop_small = _export_pred_unified_shapefile(
                 cm,
                 t1_crop,
                 t2_crop,
@@ -1342,11 +1472,17 @@ def run_tiled_inference(
                 out_dir=str(out_run),
                 stem=stem,
             )
+            drop_line = (
+                f"Omitted (< {SHAPEFILE_EXPORT_MIN_AREA_M2:.0f} m²): {n_drop_small}\n"
+                if n_drop_small
+                else ""
+            )
             infer_shp_msg = (
                 "\n\n[Vector export]\n"
                 "Status: OK\n"
                 f"Shapefile: {shp_path}\n"
-                f"Features: {feature_count}\n"
+                f"Features: {n_kept}\n"
+                f"{drop_line}"
                 "Fields: change, scd_cls, t1_cls, t2_cls"
             )
         except Exception as e:
@@ -1545,7 +1681,7 @@ def run_evaluation(
             raise ValueError("Missing reference raster path from inference cache.")
         out_dir = _SESSION.last_out_dir or str(_PROJECT_ROOT / "outputs" / "gradio_scd")
         stem = _SESSION.last_stem or Path(ref_grid).stem
-        shp_path, feature_count = _export_pred_unified_shapefile(
+        shp_path, n_kept, n_drop_small = _export_pred_unified_shapefile(
             cm,
             t1_crop,
             t2_crop,
@@ -1553,11 +1689,17 @@ def run_evaluation(
             out_dir=out_dir,
             stem=stem,
         )
+        drop_line = (
+            f"Omitted (< {SHAPEFILE_EXPORT_MIN_AREA_M2:.0f} m²): {n_drop_small}\n"
+            if n_drop_small
+            else ""
+        )
         shp_msg = (
             "\n\n[Vector export]\n"
             f"Status: OK\n"
             f"Shapefile: {shp_path}\n"
-            f"Features: {feature_count}\n"
+            f"Features: {n_kept}\n"
+            f"{drop_line}"
             "Fields: change, scd_cls, t1_cls, t2_cls"
         )
     except Exception as e:
