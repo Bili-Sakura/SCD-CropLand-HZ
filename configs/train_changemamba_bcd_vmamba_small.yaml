@@ -1,0 +1,29 @@
+# ChangeMamba BCD — VMamba-Small (architecture: vssm_small_224)
+# Paths are relative to the repository root unless absolute.
+# CLI flags override values from this file when both are used.
+
+cfg: src/ChangeMamba/changedetection/configs/vssm1/vssm_small_224.yaml
+pretrained_weight_path: models/MzeroMiko/VMamba/vssm_small_0229_ckpt_epoch_238.pth
+resume: null
+
+dataset: SYSU
+train_dataset_path: datasets/SYSU/train
+train_data_list_path: datasets/SYSU/train.txt
+test_dataset_path: datasets/SYSU/test
+test_data_list_path: datasets/SYSU/test.txt
+
+type: train
+shuffle: true
+batch_size: 16
+num_workers: 4
+crop_size: 256
+max_iters: 320000
+
+model_type: MambaBCD_Small
+model_param_path: models/BiliSakura
+model_save_path: models/BiliSakura/ChangeMambaBCD/Small
+
+cuda: true
+start_iter: 0
+learning_rate: 0.0001
+weight_decay: 0.0005
