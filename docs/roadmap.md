@@ -1,8 +1,20 @@
 # Flagship BCD model — training roadmap (three stages)
 
-This document outlines a **three-stage** schedule for the flagship **binary change detection (BCD)** backbone: high-volume pretraining on JL1 at 256px, then **joint** multi-dataset training at **512px** with a **deterministic tiling** rule, followed by a targeted Stage 3 run on `datasets/cropland_bcd_collections/input_quick`.
+This document outlines a **three-stage** schedule for the flagship **binary change detection (BCD)** backbone: high-volume pretraining on JL1 at 256px, then **joint** multi-dataset training at **512px** with a **deterministic tiling** rule, followed by a final Stage 3 run on `datasets/cropland_bcd_collections/input_quick` (merged former Stage 3 + Stage 4 behavior).
 
 Stage 2 pools **CLCD**, **HRSCD**, **FPCD**, and **Hi-CNA** (as each is available in-repo); native chip sizes differ, so each scene is sliced into **512×512** crops following the same rules.
+
+### At a glance
+
+| | Stage 1 | Stage 2 | Stage 3 |
+|---|---------|---------|---------|
+| Resolution | 256×256 | 512×512 | 512×512 |
+| Dataset source | JL1 | CLCD, HRSCD, FPCD, Hi-CNA | HZ (`input_quick`) |
+| Patch number | ~6,000 | 126,573 | ~460 |
+| BS | 32 | 8 | 8 |
+| Steps | 40,000 | 50,000 | 12,000 |
+
+Patch counts are approximate: Stage 2 total matches the [joint pool](#stage-2-patch-count-512512) row; Stage 3 depends on the `input_quick` manifest. Batch sizes match `scripts/train_flagship_bcd_multistage.sh` defaults.
 
 ### Native geometry (public cropland change datasets)
 
@@ -22,10 +34,11 @@ Values below match common paper summaries (GSD, chip size at release, pair count
 | Item | Setting |
 |------|---------|
 | Data | Full JL1 **training** split (~6k samples; adjust if your reformatted layout differs) |
+| GPU | **NVIDIA RTX 4090 (24GB)** — flagship config uses this as the reference machine for Stage 1 |
 | Input size | 256×256 |
 | Augmentation | **No** random crop (full-patch training) |
 | Steps | 40,000 |
-| Batch size | 8 |
+| Batch size | **8** (`configs/flagship_bcd_stage1_jl1_vmamba_base.yaml`) |
 
 **Goal:** Learn robust BCD cues on a large, fixed-crop cropland competition–style set before scaling resolution.
 
@@ -95,13 +108,14 @@ If you **exclude** test (or any split) from training, recompute the **Pairs** co
 | Item | Setting |
 |------|---------|
 | Data | `datasets/cropland_bcd_collections/input_quick` |
-| Purpose | Final targeted adaptation on the `input_quick` subset after Stage 2 |
+| Purpose | Final targeted adaptation on full input_quick train+val after Stage 2 |
 | Init checkpoint | Best (or final) checkpoint from Stage 2 |
 | Preprocess | Same as Stage 2: **512×512** crops per [Stage 2 cropping rules](#stage-2-cropping-rules-full-coverage-minimal-overlap) |
 | Input size | **512×512** |
-| Steps / batch | **TBD** (set once `input_quick` pair count is finalized) |
+| Eval list | Full input_quick train+val manifest (intentional overlap-aware monitoring) |
+| Steps / batch | **12,000 / 2** (merged former Stage 3 + Stage 4) |
 
-**Goal:** Finish with a short, reproducible refinement pass tailored to the `input_quick` distribution.
+**Goal:** Single final-domain pass tailored to the `input_quick` distribution while using all available input_quick train+val samples.
 
 ---
 

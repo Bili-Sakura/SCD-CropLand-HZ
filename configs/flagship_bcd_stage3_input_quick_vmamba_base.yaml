@@ -1,8 +1,7 @@
-# Stage 2 — joint 512px fine-tune (see docs/roadmap.md)
+# Stage 3 — input_quick final refinement (see docs/roadmap.md)
 # Target GPU: NVIDIA A100-SXM4-80GB → batch_size: 8 at 512×512.
-# Stage-2 manifest should contain CLCD + HRSCD + FPCD + Hi-CNA entries together.
-# Resume from stage 1: pass --resume path to last_model.pth (multistage shell does this).
-# Eval during training always uses input_quick/val.
+# Merged Stage 3 + Stage 4: one final pass on full input_quick train+val.
+# Steps/batch can be overridden from CLI if you want a shorter or longer pass.
 
 cfg: src/ChangeMamba/changedetection/configs/vssm1/vssm_base_224.yaml
 pretrained_weight_path: /root/workspace/sakura/SCD-CropLand-HZ/models/MzeroMiko/VMamba/vssm_base_0229_ckpt_epoch_237.pth
@@ -10,7 +9,7 @@ resume: null
 
 dataset: CROPLAND_BCD_COLLECTIONS
 train_dataset_path: datasets/cropland_bcd_collections
-train_data_list_path: datasets/cropland_bcd_collections/train_stage2_joint.txt
+train_data_list_path: datasets/cropland_bcd_collections/train_stage3_input_quick_trainval.txt
 test_dataset_path: datasets/cropland_bcd_collections
 test_data_list_path: datasets/cropland_bcd_collections/val_stage3_input_quick_val.txt
 
@@ -20,11 +19,11 @@ train_augment: false
 batch_size: 8
 num_workers: 8
 crop_size: 512
-max_iters: 50000
+max_iters: 10000
 
 model_type: MambaBCD_Base
 model_param_path: models/BiliSakura
-model_save_path: models/BiliSakura/ChangeMambaBCD/FlagshipBaseStage2_Joint512
+model_save_path: models/BiliSakura/ChangeMambaBCD/FlagshipBaseStage3_InputQuick
 
 cuda: true
 start_iter: 0

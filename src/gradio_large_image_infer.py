@@ -1301,11 +1301,9 @@ def run_tiled_inference(
             scene_change_overlay,
         )
     patch_labels = list(patch_samples.keys())
-    pred_lbl = _patch_pred_label()
     if patch_labels:
         patch_dropdown = gr.update(choices=patch_labels, value=patch_labels[0])
-        patch_scene, patch_inputs, patch_preds_arr, patch_info = show_patch_details(patch_labels[0])
-        patch_preds = gr.update(value=patch_preds_arr, label=pred_lbl)
+        patch_scene, patch_inputs, patch_preds, patch_info = show_patch_details(patch_labels[0])
     else:
         patch_dropdown, patch_scene, patch_inputs, patch_preds, patch_gallery, patch_info = _empty_patch_outputs()
 

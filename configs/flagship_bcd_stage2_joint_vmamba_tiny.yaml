@@ -16,7 +16,7 @@ type: train
 shuffle: true
 train_augment: false
 batch_size: 2
-num_workers: 4
+num_workers: 8
 crop_size: 512
 max_iters: 50000
 

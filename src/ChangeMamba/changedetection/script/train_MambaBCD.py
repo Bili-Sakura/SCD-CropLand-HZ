@@ -81,6 +81,7 @@ class Trainer(object):
             use_checkpoint=config.TRAIN.USE_CHECKPOINT,
             ) 
         self.deep_model = self.deep_model.cuda()
+
         if getattr(args, "model_save_path", None):
             self.model_save_path = args.model_save_path.rstrip("/")
         else:
@@ -145,16 +146,23 @@ class Trainer(object):
             if step % 10 == 0:
                 print(f'iter is {step}, overall loss is {final_loss}')
                 log_metrics({"train/loss": float(final_loss.item())}, step=step)
-                if step % 500 == 0:
-                    self.deep_model.eval()
-                    rec, pre, oa, f1_score, iou, kc = self.validation()
-                    log_metrics({"val/recall": rec, "val/precision": pre, "val/oa": oa, "val/f1_score": f1_score, "val/iou": iou, "val/kappa": kc}, step=step)
-                    if kc > best_kc:
-                        torch.save(self.deep_model.state_dict(),
-                                   os.path.join(self.model_save_path, f'{step}_model.pth'))
-                        best_kc = kc
-                        best_round = [rec, pre, oa, f1_score, iou, kc]
-                    self.deep_model.train()
+            eval_every = max(1, int(getattr(self.args, "eval_interval", 2000)))
+            ckpt_every = max(1, int(getattr(self.args, "checkpoint_interval", 10000)))
+            if step % eval_every == 0:
+                self.deep_model.eval()
+                rec, pre, oa, f1_score, iou, kc = self.validation()
+                log_metrics({"val/recall": rec, "val/precision": pre, "val/oa": oa, "val/f1_score": f1_score, "val/iou": iou, "val/kappa": kc}, step=step)
+                if kc > best_kc:
+                    torch.save(self.deep_model.state_dict(),
+                               os.path.join(self.model_save_path, f'{step}_model.pth'))
+                    best_kc = kc
+                    best_round = [rec, pre, oa, f1_score, iou, kc]
+                self.deep_model.train()
+            if step % ckpt_every == 0:
+                torch.save(
+                    self.deep_model.state_dict(),
+                    os.path.join(self.model_save_path, f'checkpoint_step_{step}.pth'),
+                )
 
         torch.save(
             self.deep_model.state_dict(),
@@ -165,7 +173,8 @@ class Trainer(object):
     def validation(self):
         print('---------starting evaluation-----------')
         self.evaluator.reset()
-        val_crop = int(getattr(self.args, "crop_size", 256))
+        val_crop = self._resolve_eval_crop_size()
+        print(f"Validation crop_size={val_crop}")
         if "CROPLAND_BCD_COLLECTIONS" in self.args.dataset:
             dataset = CroplandCollectionsBCDDataset(
                 self.args.test_dataset_path,
@@ -214,6 +223,24 @@ class Trainer(object):
         print(f'Racall rate is {rec}, Precision rate is {pre}, OA is {oa}, '
               f'F1 score is {f1_score}, IoU is {iou}, Kappa coefficient is {kc}')
         return rec, pre, oa, f1_score, iou, kc
+
+    def _resolve_eval_crop_size(self) -> int:
+        # Explicit override takes priority when provided.
+        eval_crop = getattr(self.args, "eval_crop_size", None)
+        if eval_crop is not None:
+            return int(eval_crop)
+
+        # Stage policy:
+        # - stage1 -> 256
+        # - stage2/stage3 -> 512
+        train_list_path = str(getattr(self.args, "train_data_list_path", "") or "").lower()
+        if "train_stage1" in train_list_path:
+            return 256
+        if "train_stage2" in train_list_path or "train_stage3" in train_list_path:
+            return 512
+
+        # Fallback for non-flagship runs.
+        return int(getattr(self.args, "crop_size", 256))
 
 
 _TRAINING_PATH_KEYS = frozenset({
@@ -300,6 +327,12 @@ def _parse_args_with_training_yaml(project_root):
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--crop_size", type=int, default=256)
     parser.add_argument(
+        "--eval_crop_size",
+        type=int,
+        default=None,
+        help="Evaluation crop size override. If unset, stage policy is used: stage1=256, stage2/3=512.",
+    )
+    parser.add_argument(
         "--train_augment",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -310,6 +343,18 @@ def _parse_args_with_training_yaml(project_root):
     parser.add_argument("--start_iter", type=int, default=0)
     parser.add_argument("--cuda", type=bool, default=True)
     parser.add_argument("--max_iters", type=int, default=240000)
+    parser.add_argument(
+        "--eval_interval",
+        type=int,
+        default=2000,
+        help="Run validation, SwanLab val/* metrics, and best-kappa checkpoint every N steps.",
+    )
+    parser.add_argument(
+        "--checkpoint_interval",
+        type=int,
+        default=10000,
+        help="Write checkpoint_step_{step}.pth every N steps (in addition to last_model.pth at end).",
+    )
     parser.add_argument("--model_type", type=str, default="ChangeMambaBCD")
     parser.add_argument("--model_param_path", type=str, default="../saved_models")
     parser.add_argument(
