@@ -29,7 +29,11 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from ChangeMamba.changedetection.datasets.make_data_loader import ChangeDetectionDatset, make_data_loader
+from ChangeMamba.changedetection.datasets.make_data_loader import (
+    ChangeDetectionDatset,
+    CroplandCollectionsBCDDataset,
+    make_data_loader,
+)
 from ChangeMamba.changedetection.utils_func.metrics import Evaluator
 from ChangeMamba.changedetection.models.ChangeMambaBCD import ChangeMambaBCD
 
@@ -84,7 +88,6 @@ class Trainer(object):
                 args.model_param_path, args.dataset, args.model_type + "_" + str(time.time())
             )
         self.lr = args.learning_rate
-        self.epoch = args.max_iters // args.batch_size
 
         if not os.path.exists(self.model_save_path):
             os.makedirs(self.model_save_path)
@@ -113,16 +116,20 @@ class Trainer(object):
         best_kc = 0.0
         best_round = []
         torch.cuda.empty_cache()
-        elem_num = len(self.train_data_loader)
-        train_enumerator = enumerate(self.train_data_loader)
-        for _ in tqdm(range(elem_num)):
-            itera, data = train_enumerator.__next__()
+        max_iters = int(self.args.max_iters)
+        loader = self.train_data_loader
+        train_it = iter(loader)
+        for itera in tqdm(range(max_iters)):
+            try:
+                data = next(train_it)
+            except StopIteration:
+                train_it = iter(loader)
+                data = next(train_it)
             pre_change_imgs, post_change_imgs, labels, _ = data
 
             pre_change_imgs = pre_change_imgs.cuda().float()
             post_change_imgs = post_change_imgs.cuda()
             labels = labels.cuda().long()
-
 
             output_1 = self.deep_model(pre_change_imgs, post_change_imgs)
 
@@ -134,26 +141,47 @@ class Trainer(object):
 
             final_loss.backward()
             self.optim.step()
-            if (itera + 1) % 10 == 0:
-                print(f'iter is {itera + 1}, overall loss is {final_loss}')
-                log_metrics({"train/loss": float(final_loss.item())}, step=itera + 1)
-                if (itera + 1) % 500 == 0:
+            step = itera + 1
+            if step % 10 == 0:
+                print(f'iter is {step}, overall loss is {final_loss}')
+                log_metrics({"train/loss": float(final_loss.item())}, step=step)
+                if step % 500 == 0:
                     self.deep_model.eval()
                     rec, pre, oa, f1_score, iou, kc = self.validation()
-                    log_metrics({"val/recall": rec, "val/precision": pre, "val/oa": oa, "val/f1_score": f1_score, "val/iou": iou, "val/kappa": kc}, step=itera + 1)
+                    log_metrics({"val/recall": rec, "val/precision": pre, "val/oa": oa, "val/f1_score": f1_score, "val/iou": iou, "val/kappa": kc}, step=step)
                     if kc > best_kc:
                         torch.save(self.deep_model.state_dict(),
-                                   os.path.join(self.model_save_path, f'{itera + 1}_model.pth'))
+                                   os.path.join(self.model_save_path, f'{step}_model.pth'))
                         best_kc = kc
                         best_round = [rec, pre, oa, f1_score, iou, kc]
                     self.deep_model.train()
 
+        torch.save(
+            self.deep_model.state_dict(),
+            os.path.join(self.model_save_path, "last_model.pth"),
+        )
         print('The accuracy of the best round is ', best_round)
 
     def validation(self):
         print('---------starting evaluation-----------')
         self.evaluator.reset()
-        dataset = ChangeDetectionDatset(self.args.test_dataset_path, self.args.test_data_name_list, 256, None, 'test')
+        val_crop = int(getattr(self.args, "crop_size", 256))
+        if "CROPLAND_BCD_COLLECTIONS" in self.args.dataset:
+            dataset = CroplandCollectionsBCDDataset(
+                self.args.test_dataset_path,
+                self.args.test_data_name_list,
+                val_crop,
+                None,
+                'test',
+            )
+        else:
+            dataset = ChangeDetectionDatset(
+                self.args.test_dataset_path,
+                self.args.test_data_name_list,
+                val_crop,
+                None,
+                'test',
+            )
         nw_val = getattr(self.args, "num_workers", None)
         if nw_val is None:
             nw_val = 4
@@ -271,6 +299,12 @@ def _parse_args_with_training_yaml(project_root):
     )
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--crop_size", type=int, default=256)
+    parser.add_argument(
+        "--train_augment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="If disabled (--no-train_augment), skip random crop / flip / rot on training pairs.",
+    )
     parser.add_argument("--train_data_name_list", type=list)
     parser.add_argument("--test_data_name_list", type=list)
     parser.add_argument("--start_iter", type=int, default=0)

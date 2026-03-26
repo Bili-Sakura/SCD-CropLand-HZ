@@ -1,0 +1,30 @@
+# Stage 2 — joint 512px fine-tune (see docs/roadmap.md)
+# Currently: CLCD train+val+test in one manifest. Append HRSCD/FPCD/Hi-CNA lines when wired.
+# Resume from stage 1: pass --resume path to last_model.pth (multistage shell does this).
+
+cfg: src/ChangeMamba/changedetection/configs/vssm1/vssm_base_224.yaml
+pretrained_weight_path: /root/workspace/sakura/SCD-CropLand-HZ/models/MzeroMiko/VMamba/vssm_base_0229_ckpt_epoch_237.pth
+resume: null
+
+dataset: CROPLAND_BCD_COLLECTIONS
+train_dataset_path: datasets/cropland_bcd_collections
+train_data_list_path: datasets/cropland_bcd_collections/train_stage2_joint.txt
+test_dataset_path: datasets/cropland_bcd_collections
+test_data_list_path: datasets/cropland_bcd_collections/val_stage2_clcd.txt
+
+type: train
+shuffle: true
+train_augment: false
+batch_size: 2
+num_workers: 4
+crop_size: 512
+max_iters: 50000
+
+model_type: MambaBCD_Base
+model_param_path: models/BiliSakura
+model_save_path: models/BiliSakura/ChangeMambaBCD/FlagshipBaseStage2_Joint512
+
+cuda: true
+start_iter: 0
+learning_rate: 0.0001
+weight_decay: 0.0005

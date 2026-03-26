@@ -114,3 +114,42 @@ python scripts/build_jl1_second_holdout_test.py
   keywords = {Cross-difference,Data mining,Data models,deep learning,Feature extraction,remote sensing image,Self-supervised learning,semantic change detection (SCD),semantic consistency,Semantics,Solid modeling,Task analysis}
 }
 ```
+
+## Cropland BCD collections (multi-stage training)
+
+Use the converter below to build a unified BCD collection from:
+
+- `data/input` (quick-test large scene, tiled to patches)
+- `datasets/jl1_cropland_competition_2023/train`
+- `datasets/CLCD`
+
+```bash
+python scripts/reformat_cropland_to_bcd_collections.py
+```
+
+Output root:
+
+```
+datasets/cropland_bcd_collections/
+├── clcd/
+├── jl1_competition/
+├── input_quick/
+├── train_all.txt
+├── val_all.txt
+└── test_all.txt
+```
+
+Per-source split format (ChangeMamba BCD):
+
+```
+<source>/<split>/
+├── T1/
+├── T2/
+└── GT/      # 0/255 binary map
+```
+
+`train_all.txt` / `val_all.txt` entries use:
+
+```
+source/split/file.png
+```

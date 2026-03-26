@@ -1,0 +1,27 @@
+# ChangeMamba BCD on unified cropland collections (multi-source)
+
+cfg: src/ChangeMamba/changedetection/configs/vssm1/vssm_tiny_224_0229flex.yaml
+pretrained_weight_path: models/MzeroMiko/VMamba/vssm_tiny_0229_ckpt_epoch_292.pth
+resume: null
+
+dataset: CROPLAND_BCD_COLLECTIONS
+train_dataset_path: datasets/cropland_bcd_collections
+train_data_list_path: datasets/cropland_bcd_collections/train_all.txt
+test_dataset_path: datasets/cropland_bcd_collections
+test_data_list_path: datasets/cropland_bcd_collections/val_all.txt
+
+type: train
+shuffle: true
+batch_size: 16
+num_workers: 4
+crop_size: 256
+max_iters: 320000
+
+model_type: MambaBCD_Tiny
+model_param_path: models/BiliSakura
+model_save_path: models/BiliSakura/ChangeMambaBCD/CroplandCollectionsTiny
+
+cuda: true
+start_iter: 0
+learning_rate: 0.0001
+weight_decay: 0.0005

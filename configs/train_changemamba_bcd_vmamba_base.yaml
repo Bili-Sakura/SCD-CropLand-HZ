@@ -3,7 +3,7 @@
 # CLI flags override values from this file when both are used.
 
 cfg: src/ChangeMamba/changedetection/configs/vssm1/vssm_base_224.yaml
-pretrained_weight_path: models/MzeroMiko/VMamba/vssm_base_0229_ckpt_epoch_237.pth
+pretrained_weight_path: /root/workspace/sakura/SCD-CropLand-HZ/models/MzeroMiko/VMamba/vssm_base_0229_ckpt_epoch_237.pth
 resume: null
 
 dataset: SYSU

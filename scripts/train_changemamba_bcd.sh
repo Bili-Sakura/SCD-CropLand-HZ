@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # ChangeMamba BCD training — defaults live in ./configs/train_changemamba_bcd_vmamba_*.yaml
 #
+# Two-stage flagship JL1 → joint 512 (one sequential run):
+#   ./scripts/train_flagship_bcd_multistage.sh
+#
 # Usage:
 #   ./scripts/train_changemamba_bcd.sh
 #   ./scripts/train_changemamba_bcd.sh configs/train_changemamba_bcd_vmamba_small.yaml

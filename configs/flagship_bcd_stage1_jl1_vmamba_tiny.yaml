@@ -1,0 +1,29 @@
+# Stage 1 — JL1 pretrain (see docs/roadmap.md)
+# Manifest: jl1_competition/train only (~5.4k), val: jl1_competition/val.
+
+cfg: src/ChangeMamba/changedetection/configs/vssm1/vssm_base_224.yaml
+pretrained_weight_path: /root/workspace/sakura/SCD-CropLand-HZ/models/MzeroMiko/VMamba/vssm_base_0229_ckpt_epoch_237.pth
+resume: null
+
+dataset: CROPLAND_BCD_COLLECTIONS
+train_dataset_path: datasets/cropland_bcd_collections
+train_data_list_path: datasets/cropland_bcd_collections/train_stage1_jl1.txt
+test_dataset_path: datasets/cropland_bcd_collections
+test_data_list_path: datasets/cropland_bcd_collections/val_stage1_jl1.txt
+
+type: train
+shuffle: true
+train_augment: false
+batch_size: 8
+num_workers: 4
+crop_size: 256
+max_iters: 40000
+
+model_type: MambaBCD_Base
+model_param_path: models/BiliSakura
+model_save_path: models/BiliSakura/ChangeMambaBCD/FlagshipBaseStage1_JL1
+
+cuda: true
+start_iter: 0
+learning_rate: 0.0001
+weight_decay: 0.0005

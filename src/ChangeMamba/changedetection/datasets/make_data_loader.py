@@ -27,12 +27,22 @@ def one_hot_encoding(image, num_classes=8):
 
 
 class ChangeDetectionDatset(Dataset):
-    def __init__(self, dataset_path, data_list, crop_size, max_iters=None, type='train', data_loader=img_loader):
+    def __init__(
+        self,
+        dataset_path,
+        data_list,
+        crop_size,
+        max_iters=None,
+        type='train',
+        data_loader=img_loader,
+        train_augment=True,
+    ):
         self.dataset_path = dataset_path
         self.data_list = data_list
         self.loader = data_loader
         self.type = type
         self.data_pro_type = self.type
+        self.train_augment = bool(train_augment)
 
         if max_iters is not None:
             self.data_list = self.data_list * int(np.ceil(float(max_iters) / len(self.data_list)))
@@ -63,7 +73,98 @@ class ChangeDetectionDatset(Dataset):
         label = self.loader(label_path)
         label = label / 255
 
-        if 'train' in self.data_pro_type:
+        if 'train' in self.data_pro_type and self.train_augment:
+            pre_img, post_img, label = self.__transforms(True, pre_img, post_img, label)
+        else:
+            pre_img, post_img, label = self.__transforms(False, pre_img, post_img, label)
+            label = np.asarray(label)
+
+        data_idx = self.data_list[index]
+        return pre_img, post_img, label, data_idx
+
+    def __len__(self):
+        return len(self.data_list)
+
+
+class CroplandCollectionsBCDDataset(Dataset):
+    """
+    BCD dataset over collections root with per-source subfolders.
+
+    Supported data_list entries:
+      - "source/split/name.png"  (recommended, used by *_all.txt)
+      - "source/name.png"        (split inferred from `type`)
+      - "name.png"               (fallback to dataset_path directly)
+    """
+
+    def __init__(
+        self,
+        dataset_path,
+        data_list,
+        crop_size,
+        max_iters=None,
+        type='train',
+        data_loader=img_loader,
+        train_augment=True,
+    ):
+        self.dataset_path = dataset_path
+        self.data_list = data_list
+        self.loader = data_loader
+        self.type = type
+        self.data_pro_type = self.type
+        self.train_augment = bool(train_augment)
+
+        if max_iters is not None:
+            self.data_list = self.data_list * int(np.ceil(float(max_iters) / len(self.data_list)))
+            self.data_list = self.data_list[0:max_iters]
+        self.crop_size = crop_size
+
+    def __transforms(self, aug, pre_img, post_img, label):
+        if aug:
+            pre_img, post_img, label = imutils.random_crop_new(pre_img, post_img, label, self.crop_size)
+            pre_img, post_img, label = imutils.random_fliplr(pre_img, post_img, label)
+            pre_img, post_img, label = imutils.random_flipud(pre_img, post_img, label)
+            pre_img, post_img, label = imutils.random_rot(pre_img, post_img, label)
+
+        pre_img = imutils.normalize_img(pre_img)
+        pre_img = np.transpose(pre_img, (2, 0, 1))
+
+        post_img = imutils.normalize_img(post_img)
+        post_img = np.transpose(post_img, (2, 0, 1))
+
+        return pre_img, post_img, label
+
+    def _resolve_sample_paths(self, sample_entry):
+        e = str(sample_entry).replace("\\", "/")
+        parts = [p for p in e.split("/") if p]
+        root = self.dataset_path
+
+        if len(parts) >= 3:
+            source, split = parts[0], parts[1]
+            name = parts[-1]
+            base = os.path.join(root, source, split)
+        elif len(parts) == 2:
+            source, name = parts
+            split = self.type
+            base_candidate = os.path.join(root, source, split)
+            base = base_candidate if os.path.isdir(base_candidate) else os.path.join(root, source)
+        else:
+            name = parts[0] if parts else e
+            base_candidate = os.path.join(root, self.type)
+            base = base_candidate if os.path.isdir(base_candidate) else root
+
+        pre_path = os.path.join(base, 'T1', name)
+        post_path = os.path.join(base, 'T2', name)
+        label_path = os.path.join(base, 'GT', name)
+        return pre_path, post_path, label_path
+
+    def __getitem__(self, index):
+        pre_path, post_path, label_path = self._resolve_sample_paths(self.data_list[index])
+        pre_img = self.loader(pre_path)
+        post_img = self.loader(post_path)
+        label = self.loader(label_path)
+        label = label / 255
+
+        if 'train' in self.data_pro_type and self.train_augment:
             pre_img, post_img, label = self.__transforms(True, pre_img, post_img, label)
         else:
             pre_img, post_img, label = self.__transforms(False, pre_img, post_img, label)
@@ -299,10 +400,38 @@ def _dataloader_memory_kwargs(num_workers):
 
 
 def make_data_loader(args, **kwargs):  # **kwargs could be omitted
+    _ta = getattr(args, "train_augment", True)
     if 'SYSU' in args.dataset or 'LEVIR-CD+' in args.dataset or 'WHU' in args.dataset:
-        dataset = ChangeDetectionDatset(args.train_dataset_path, args.train_data_name_list, args.crop_size, None, args.type)
+        dataset = ChangeDetectionDatset(
+            args.train_dataset_path,
+            args.train_data_name_list,
+            args.crop_size,
+            None,
+            args.type,
+            train_augment=_ta,
+        )
         # train_sampler = DistributedSampler(dataset, shuffle=True)
         nw = _dataloader_num_workers(args, 16)
+        data_loader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=args.shuffle,
+            **_dataloader_memory_kwargs(nw),
+            **kwargs,
+            num_workers=nw,
+            drop_last=False,
+        )
+        return data_loader
+    elif 'CROPLAND_BCD_COLLECTIONS' in args.dataset:
+        dataset = CroplandCollectionsBCDDataset(
+            args.train_dataset_path,
+            args.train_data_name_list,
+            args.crop_size,
+            None,
+            args.type,
+            train_augment=_ta,
+        )
+        nw = _dataloader_num_workers(args, 8)
         data_loader = DataLoader(
             dataset,
             batch_size=args.batch_size,
